@@ -1,0 +1,8 @@
+# 2026-10-26 Background reply transport
+
+- Add capture-archive public-room discovery with current platform room/owner/admin evidence. Historical internal room IDs are not reused as a current broadcast.
+- Dedicated driver checks current self identity, owner, room and editable controls. It supports an explicitly owned loopback debug browser retained after human login; Windows hiding validates the browser process and dedicated profile and checks that its windows are invisible. No user desktop apps are controlled.
+- User completed the dedicated login. A read-only runtime probe verified assistant/owner/admin, live room, hidden windows and usable controls. Restarted headless contexts had shown login required; exact platform/session cause remains unknown. Preserving the authenticated context is the operational resolution, not a challenge bypass.
+- Driver submits only through the host identity boundary, pins page generation and text, checks cancellation/deadline and enforces an interval. SVG send controls use one DOM click event. Delivery remains uncertain without platform or viewer confirmation; unknown outcomes halt sending and are never automatically retried.
+- Reply execution remains opt-in; role and permissions are derived from current evidence. Mention/product/block/private actions are unsupported. Former Harness diagnostics are retained and syntax checked; no real identifiers or credentials are included.
+- Retained self-page selection accepts the site's own profile redirect, requiring a single owned profile page; identity still comes from a fresh platform response. First deployment exposed the redirect mismatch before any send; selection was corrected.

@@ -11,6 +11,7 @@ import windowManager from './windowManager'
 import './ipc'
 import { createLogger } from './logger'
 import { accountManager } from './managers/AccountManager'
+import { readBridgeConfigFromEnv, startHostBridge, type RunningHostBridge } from './bridge'
 
 // const _require = createRequire(import.meta.url)
 
@@ -138,6 +139,37 @@ app
   .then(logStartupInfo)
   .then(() => providerService.initialize())
   .then(createWindow)
+  .then(startBridge)
+
+/**
+ * 准入桥接：只有配置了私有 token 才启动。
+ * 没有 token 就不要开这个口子 —— 隐式默认口令比不启动危险得多。
+ * 启动失败也只记日志，不让直播工具的界面因为桥接没起来而不可用。
+ */
+let bridge: RunningHostBridge | null = null
+async function startBridge(): Promise<void> {
+  const logger = createLogger('准入桥接')
+  let config = null
+  try {
+    config = readBridgeConfigFromEnv()
+  } catch (error) {
+    logger.error('桥接配置无效，未启动', { message: error instanceof Error ? error.message : String(error) })
+    return
+  }
+  if (!config) {
+    logger.info('未配置 LIVE_ASSISTANT_BRIDGE_TOKEN，准入桥接不启动')
+    return
+  }
+  try {
+    bridge = await startHostBridge(config)
+  } catch (error) {
+    logger.error('准入桥接启动失败', { message: error instanceof Error ? error.message : String(error) })
+  }
+}
+
+app.on('will-quit', () => {
+  void bridge?.stop()
+})
 
 app.on('window-all-closed', async () => {
   win = null

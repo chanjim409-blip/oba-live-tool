@@ -150,6 +150,14 @@ export class AccountSession {
     return this.platform.sendRedPacket(duration)
   }
 
+  /**
+   * 准入桥接用：把平台适配器（以及它钉住的那张页面）暴露给身份读取方。
+   * 只读访问，不改变任务、连接或登录状态；不提供任何发送入口。
+   */
+  public getPlatform(): IPlatform {
+    return this.platform
+  }
+
   public updateTaskConfig<T extends LiveControlTask>(
     type: T['type'],
     config: Partial<T['config']>,

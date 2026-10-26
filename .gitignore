@@ -43,3 +43,5 @@ coverage/
 
 .trae
 .claude
+# Maintenance fork: lock the tested dependency tree for repeatable installs.
+!package-lock.json
