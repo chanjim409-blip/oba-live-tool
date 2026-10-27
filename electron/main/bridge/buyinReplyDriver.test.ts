@@ -7,16 +7,24 @@ import { chromium } from 'playwright'
 
 function fixture() {
   let clicks = 0, fills = 0, generation = 1, challenge = false
-  const facts = { userId: 'owner', buyinAccountId: 'executor', drAuth: {}, observedAt: new Date().toISOString() }
+  const facts = { userId: 'owner', buyinAccountId: 'executor', loginUserId: 'login-one', drAuth: {}, observedAt: new Date().toISOString() }
   const page = { locator: (s: string) => ({ count: async () => s.includes('captcha') ? Number(challenge) : 1,
-    isVisible: async () => true, isEditable: async () => true, fill: async () => { fills++ } }),
+    isVisible: async () => true, isEditable: async () => true, getAttribute: async () => null, fill: async () => { fills++ } }),
     evaluate: async () => { clicks++ } }
   const tap = { markPlatformRestriction: () => {}, refreshReplyEvidence: async () => {}, replyContext: () => ({ page, generation, facts,
     identityData: { synthetic_role: 'owner' }, loggedIn: true, roomId: 'room', roomObservedAt: Date.now() }) } as unknown as LiveTap
   const config = { expectedOwnerId: 'owner', expectedExecutorId: 'executor', inputSelector: 'textarea', submitSelector: 'button',
     creatorRoleEvidence: { path: ['synthetic_role'], value: 'owner' } }
-  return { tap, config, clicks: () => clicks, fills: () => fills, change: () => { generation++ }, challenge: () => { challenge = true } }
+  return { tap, config, facts, clicks: () => clicks, fills: () => fills, change: () => { generation++ }, challenge: () => { challenge = true } }
 }
+
+test('opaque login user change invalidates reply generation without inferring its role', async () => {
+  const f = fixture(); const driver = new BuyinReplyDriver(f.tap, f.config)
+  const before = await driver.snapshot()
+  f.facts.loginUserId = 'login-two'
+  const after = await driver.snapshot()
+  assert.notEqual(before.generation, after.generation)
+})
 
 test('buyin proof requires configured exact observed value, not a display name or truthy string', () => {
   assert.equal(matchesCreatorEvidence({ role: true }, undefined), false)
@@ -82,9 +90,21 @@ test('buyin DOM path clicks once; disabled or replaced text never submits (inter
     assert.equal(await page.evaluate('window.sends'), 1)
     await assert.rejects(driver.submit('合成测试', async () => { await page.locator('#input').fill('changed') }), /controls_changed/)
     await page.locator('#send').evaluate(el => el.setAttribute('disabled', ''))
-    await assert.rejects(driver.submit('合成测试', async () => {}), /controls_changed/)
+    assert.equal((await driver.snapshot()).canSend, false)
+    await assert.rejects(driver.submit('合成测试', async () => {}), /context_changed/)
     assert.equal(await page.evaluate('window.sends'), 1)
     await page.locator('#send').evaluate(el => el.removeAttribute('disabled'))
+    await page.locator('#send').evaluate(el => el.setAttribute('aria-disabled', 'true'))
+    assert.equal((await driver.snapshot()).canSend, false)
+    await assert.rejects(driver.submit('合成测试', async () => {}), /context_changed/)
+    await page.locator('#send').evaluate(el => el.removeAttribute('aria-disabled'))
+    await assert.rejects(driver.submit('合成测试', async () => { await page.locator('#send').evaluate(el => el.setAttribute('aria-disabled', 'TRUE')) }), /controls_changed/)
+    assert.equal(await page.evaluate('window.sends'), 1)
+    await page.locator('#send').evaluate(el => el.removeAttribute('aria-disabled'))
+    await page.locator('#send').evaluate(el => el.setAttribute('class', 'comment_isDisabled_example'))
+    await assert.rejects(driver.submit('合成测试', async () => {}), /context_changed/)
+    assert.equal(await page.evaluate('window.sends'), 1)
+    await page.locator('#send').evaluate(el => el.removeAttribute('class'))
     await assert.rejects(driver.submit('合成测试', async () => {
       await page.evaluate(() => { const challenge = document.createElement('div'); challenge.id = 'captcha'; challenge.style.width = '20px'; challenge.style.height = '20px'; document.body.append(challenge) })
     }), (e: any) => e.code === 'host_platform_restricted')

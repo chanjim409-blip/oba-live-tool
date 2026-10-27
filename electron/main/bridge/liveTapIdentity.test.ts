@@ -4,15 +4,15 @@ import { EventEmitter } from 'node:events'
 import { LiveTap } from './liveTap'
 
 const tick = () => new Promise(resolve => setImmediate(resolve))
-function fixture() {
-  const tap = new LiveTap({ storageStatePath: 'synthetic' })
+function fixture(identityOnly = false) {
+  const tap = new LiveTap({ storageStatePath: 'synthetic', identityOnly })
   const page = new EventEmitter() as any
   const frame = {}
   page.mainFrame = () => frame
   page.isClosed = () => false
   page.waitForSelector = async () => ({})
   page.evaluate = async () => true
-  let next = { user_id: 'synthetic-owner', buyin_account_id: 'synthetic-executor' }
+  let next = { user_id: 'synthetic-owner', buyin_account_id: 'synthetic-executor', login_user_id: 'synthetic-login-one' }
   let refreshes = 0
   page.request = { get: async () => { refreshes++; return { ok: () => true, status: () => 200, json: async () => ({ data: next }) } } }
   const internals = tap as any
@@ -24,8 +24,29 @@ function fixture() {
     headers: () => ({ 'content-type': 'application/json' }), json: async () => ({ data: next }),
   })
   return { tap, page, frame, request, respond, refreshes: () => refreshes,
-    changeExecutor: () => { next = { ...next, buyin_account_id: 'synthetic-other' } } }
+    changeExecutor: () => { next = { ...next, buyin_account_id: 'synthetic-other' } },
+    changeLogin: () => { next = { ...next, login_user_id: 'synthetic-login-two' } } }
 }
+
+test('login user change alone invalidates the room and is retained as opaque identity', async () => {
+  const f = fixture()
+  f.respond(f.request()); await tick()
+  assert.equal(f.tap.facts?.loginUserId, 'synthetic-login-one')
+  f.tap.roomId = '10000000000001'
+  f.changeLogin()
+  await f.tap.refreshIdentity()
+  assert.equal(f.tap.currentRoomId, null)
+  assert.equal(f.tap.facts?.loginUserId, 'synthetic-login-two')
+})
+
+test('identity-only observations never actively refresh on SPA navigation', async () => {
+  const f = fixture(true)
+  f.respond(f.request()); await tick()
+  f.page.emit('framenavigated', f.frame)
+  await tick()
+  assert.equal(f.refreshes(), 0)
+  assert.equal(f.tap.facts, null)
+})
 
 test('SPA navigation re-reads observed identity and restores login without reusing invalidated facts', async () => {
   const f = fixture()

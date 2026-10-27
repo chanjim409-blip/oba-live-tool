@@ -17,6 +17,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { timingSafeEqual } from 'node:crypto'
 import { join } from 'node:path'
+import { closeSync, fsyncSync, lstatSync, openSync, writeSync } from 'node:fs'
 import { LiveTap, weakViewerId } from './liveTap'
 import { openHostBridgeDb } from './sqliteDb'
 import { HostIdentityBoundary, HostIdentityError } from './vendor/hostIdentity'
@@ -27,6 +28,7 @@ import { ScopeGuard, parseScope } from './scopeGuard'
 import { RoomBrowserDriver, type RoomBrowserConfig } from './roomBrowserDriver'
 import { BackgroundReplySource } from './backgroundReplySource'
 import { BuyinReplyDriver, type BuyinReplyConfig } from './buyinReplyDriver'
+import { PlatformRestrictionStore } from './platformRestrictionStore'
 
 export interface BridgeServerConfig {
   port: number
@@ -53,6 +55,9 @@ export interface BridgeServerConfig {
   log?: (message: string) => void
   /** Dependency injection for offline contract tests; production uses LiveTap. */
   tapFactory?: (options: ConstructorParameters<typeof LiveTap>[0]) => LiveTap
+  /** Offline fault injection only; real startup uses the SQLite-backed store and room browser. */
+  restrictionStoreFactory?: (db: ReturnType<typeof openHostBridgeDb>['db']) => PlatformRestrictionStore
+  replyDriverFactory?: (config: RoomBrowserConfig) => RoomBrowserDriver
 }
 
 export interface RunningBridgeServer {
@@ -77,6 +82,27 @@ function requireVerifiedCreatorRole(enabled: boolean | undefined): void {
   if (enabled === true) throw new Error('buyin_creator_role_proof_unverified')
 }
 
+// Independent, fixed-content marker: a database write failure must not silently clear on restart.
+// If the whole volume is unwritable the process still stops, but no storage system can promise
+// a durable marker until the user repairs the volume.
+function hasStorageFault(path: string): boolean {
+  try { lstatSync(path); return true }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return false
+    throw new HostIdentityError('host_restriction_store_unavailable')
+  }
+}
+function saveStorageFault(path: string): boolean {
+  let fd: number | undefined
+  try {
+    fd = openSync(path, 'wx', 0o600)
+    writeSync(fd, 'manual-review-required\n')
+    fsyncSync(fd)
+    return true
+  } catch (error) { return (error as NodeJS.ErrnoException)?.code === 'EEXIST' }
+  finally { if (fd !== undefined) { try { closeSync(fd) } catch { /* stop is already latched */ } } }
+}
+
 export async function startBridgeServer(config: BridgeServerConfig): Promise<RunningBridgeServer> {
   if (config.token.length < MIN_TOKEN || /[\r\n]/.test(config.token)) throw new Error('bridge_token_invalid')
   // Arbitrary getUser field/value configuration is not proof of creator identity.
@@ -85,34 +111,80 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
 
   const log = config.log ?? ((message: string) => console.log(`[bridge] ${message}`))
   const expected = Buffer.from(`Bearer ${config.token}`)
+  const faultMarker = join(config.dataDir, 'buyin-restriction-storage-fault.lock')
+  const hadStorageFault = hasStorageFault(faultMarker)
+
+  // Read the durable Buyin stop before constructing or starting any collector/browser.
+  let opened: ReturnType<typeof openHostBridgeDb> | undefined
+  let restrictionStore: PlatformRestrictionStore
+  try {
+    opened = openHostBridgeDb(join(config.dataDir, 'host-identity.sqlite'))
+    restrictionStore = (config.restrictionStoreFactory ?? (db => new PlatformRestrictionStore(db)))(opened.db)
+    restrictionStore.read() // A corrupt/unavailable store cannot permit browser startup.
+  } catch {
+    saveStorageFault(faultMarker)
+    try { opened?.close() } catch { /* preserve the fixed, non-sensitive error */ }
+    throw new HostIdentityError('host_restriction_store_unavailable')
+  }
+  let replyDriver: RoomBrowserDriver | null = null
+  let tap: LiveTap | null = null
+  let volatileStop: 'host_restriction_store_unavailable' | null = hadStorageFault ? 'host_restriction_store_unavailable' : null
+  const stopOwnedBrowsers = () => {
+    const owned = replyDriver
+    replyDriver = null
+    void owned?.stop().catch(() => undefined)
+    void tap?.stop().catch(() => undefined)
+  }
+  const storageFailed = () => {
+    volatileStop = 'host_restriction_store_unavailable'
+    if (!saveStorageFault(faultMarker)) log('停刷记录及备用标记无法保存；请修复存储，不能依赖重启恢复')
+    // Also latch the collector itself so no later health tick may refresh it.
+    if (tap && !tap.restrictionCode) tap.markPlatformRestriction('host_platform_restricted')
+    stopOwnedBrowsers()
+  }
+  const currentRestriction = () => {
+    if (volatileStop) return volatileStop
+    if (tap?.restrictionCode) return tap.restrictionCode
+    try { return restrictionStore.read() }
+    catch { storageFailed(); return volatileStop }
+  }
+  const assertNotStopped = () => {
+    const code = currentRestriction()
+    if (code) throw new HostIdentityError(code)
+  }
 
   /* ------------------------------------------------------- 采集器（可缺席） */
-  let tap: LiveTap | null = null
   if (config.storageStatePath) {
     tap = (config.tapFactory ?? (options => new LiveTap(options)))({
       storageStatePath: config.storageStatePath,
       executablePath: config.executablePath ?? null,
       headless: config.headless ?? true,
+      restrictionStore,
+      onRestriction: () => {
+        // Stop the separate room browser too; a different route must not evade the stop.
+        if (tap?.restrictionCode === 'host_restriction_store_unavailable') storageFailed()
+        else stopOwnedBrowsers()
+      },
       log,
     })
     try {
-      await tap.start()
+      if (!currentRestriction()) await tap.start()
+      else log('百应存在未解除的平台限制，采集器保持停止，等待人工处理')
     } catch (error) {
       log(`采集器启动失败：${error instanceof Error ? error.message : String(error)}`)
       await tap.stop().catch(() => undefined)
-      tap = null
+      // Keep a latched collector for read-only health reporting, even after its page was closed.
+      if (!tap.restrictionCode) tap = null
     }
   } else {
     log('未提供登录态文件，采集器不启动（/health 会如实返回 logged_in=false）')
   }
 
   /* ------------------------------------------------ 身份边界（默认关闭） */
-  const opened = openHostBridgeDb(join(config.dataDir, 'host-identity.sqlite'))
   /** 业务侧登记的场次作用域：身份源用它和页面上的真实达人/房间做交叉核对 */
   const scopeGuard = new ScopeGuard(() => ({ loggedIn: tap?.loggedIn ?? false, accountId: tap?.facts?.userId ?? null, roomId: tap?.currentRoomId ?? null }))
-  let replyDriver: RoomBrowserDriver | null = null
-  if (config.replyBrowser) {
-    replyDriver = new RoomBrowserDriver(config.replyBrowser)
+  if (config.replyBrowser && !currentRestriction()) {
+    replyDriver = (config.replyDriverFactory ?? (value => new RoomBrowserDriver(value)))(config.replyBrowser)
     try { await replyDriver.start() }
     catch { await replyDriver.stop().catch(() => undefined); replyDriver = null; log('后台回复浏览器未就绪，执行保持拒绝') }
   }
@@ -123,15 +195,19 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
   const buyinSource = buyinDriver && config.buyinReply ? new BackgroundReplySource(buyinDriver, () => scopeGuard.current,
     { ownerId: config.buyinReply.expectedOwnerId, executorId: config.buyinReply.expectedExecutorId, minIntervalMs: 15_000, surface: 'buyin' }) : null
   const source: HostIdentitySource = {
-    withContext: (surface, run) => surface === 'douyin_room' && replySource
-      ? replySource.withContext(surface, async context => run({ ...context, execute: async (action, signal) => {
-        if (config.replyExecutionEnabled !== true) throw new Error('host_execution_disabled')
-        return context.execute(action, signal)
-      } })) : surface === 'buyin' && buyinSource
-        ? buyinSource.withContext(surface, async context => run({ ...context, execute: async (action, signal) => {
-          if (config.buyinReplyExecutionEnabled !== true) throw new Error('host_execution_disabled')
+    withContext: (surface, run) => {
+      assertNotStopped()
+      const chosen = surface === 'douyin_room' && replySource ? replySource : surface === 'buyin' && buyinSource ? buyinSource : readSource
+      return chosen.withContext(surface, context => run({ ...context,
+        read: async signal => { assertNotStopped(); const result = await context.read(signal); assertNotStopped(); return result },
+        execute: async (action, signal) => {
+          assertNotStopped()
+          if (chosen === replySource && config.replyExecutionEnabled !== true) throw new Error('host_execution_disabled')
+          if (chosen === buyinSource && config.buyinReplyExecutionEnabled !== true) throw new Error('host_execution_disabled')
           return context.execute(action, signal)
-        } })) : readSource.withContext(surface, run),
+        },
+      }))
+    },
   }
   const boundary = new HostIdentityBoundary({
     db: opened.db,
@@ -203,11 +279,35 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
         session_id: url.searchParams.get('session_id') ?? null,
       }
 
+      // The host is the only writer. An isolated probe may report a stop but can never clear one.
+      if (url.pathname === '/collector/restriction' && request.method === 'GET') {
+        json(200, { restriction_code: currentRestriction() })
+        return
+      }
+      if (url.pathname === '/collector/restriction' && request.method === 'POST') {
+        const body = await readJson(request)
+        const allowed = ['host_login_expired', 'host_permission_denied', 'host_rate_limited', 'host_platform_restricted'] as const
+        const code = body.code
+        if (Object.keys(body).length !== 1 || typeof code !== 'string' || !allowed.includes(code as typeof allowed[number])) {
+          json(400, { error_code: 'bridge_restriction_report_invalid' }); return
+        }
+        if (tap) tap.markPlatformRestriction(code as typeof allowed[number])
+        else {
+          try { restrictionStore.record(code as typeof allowed[number]) }
+          catch { storageFailed(); throw new HostIdentityError('host_restriction_store_unavailable') }
+        }
+        if (replyDriver) { await replyDriver.stop(); replyDriver = null }
+        const recorded = currentRestriction()
+        if (recorded === 'host_restriction_store_unavailable') throw new HostIdentityError(recorded)
+        json(200, { restriction_code: recorded })
+        return
+      }
+
       if (request.method === 'GET' && url.pathname === '/health') {
-        if (tap && !tap.loggedIn && !tap.restrictionCode) await tap.refreshIdentity()
-        json(200, { ok: true, bridge: 'live-assistant-host', ...(tap ? tap.status() : { logged_in: false, live: false }),
+        if (tap && !tap.loggedIn && !currentRestriction()) await tap.refreshIdentity()
+        json(200, { ok: true, bridge: 'live-assistant-host', ...(tap ? tap.status() : { logged_in: false, live: false }), restriction_code: currentRestriction(),
           reply_transport: replyDriver ? (config.replyBrowser?.attachedEndpoint ? 'hidden_owned_browser' : 'headless_browser') : null,
-          reply_execution_enabled: !!replySource && config.replyExecutionEnabled === true && !replyDriver?.manualVerificationActive,
+          reply_execution_enabled: !!replyDriver && !!replySource && config.replyExecutionEnabled === true && !replyDriver.manualVerificationActive,
           buyin_reply_configured: !!buyinDriver,
           buyin_reply_execution_enabled: !!buyinSource && config.buyinReplyExecutionEnabled === true })
         return
@@ -239,6 +339,7 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
         return
       }
       if (request.method === 'POST' && ['/reply/manual-verification/open', '/reply/manual-verification/complete'].includes(url.pathname)) {
+        assertNotStopped()
         if (!replyDriver || !replySource) { json(409, { error_code: 'bridge_reply_unavailable' }); return }
         const body = await readJson(request)
         if (Object.keys(body).length !== 1 || body.confirmed !== true) { json(400, { error_code: 'bridge_manual_confirmation_required' }); return }
@@ -253,6 +354,7 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
         return
       }
       if (request.method === 'POST' && url.pathname === '/reply/refresh') {
+        assertNotStopped()
         if (!replyDriver) { json(409, { error_code: 'bridge_reply_unavailable' }); return }
         await replyDriver.refresh()
         json(200, await replyDriver.inspect())
@@ -394,7 +496,7 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
 
       json(404, { error_code: 'bridge_route_not_implemented', path: url.pathname })
     } catch (error) {
-      const knownStopCodes = ['host_login_expired', 'host_permission_denied', 'host_rate_limited', 'host_platform_restricted']
+      const knownStopCodes = ['host_login_expired', 'host_permission_denied', 'host_rate_limited', 'host_platform_restricted', 'host_restriction_store_unavailable']
       const code = error instanceof HostIdentityError && knownStopCodes.includes(error.code) ? error.code
         : error instanceof Error && /^bridge_[a-z_]+$/.test(error.message) ? error.message : 'bridge_failed'
       log(`请求失败：${code}`)

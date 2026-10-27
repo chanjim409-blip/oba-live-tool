@@ -13,6 +13,7 @@
  * 作者后台），所以该面一律拒绝——宁可不提供，也不拿百应页面冒充"抖音直播间管理员"。
  * 也不回执执行：`execute()` 恒抛 `host_execution_disabled`。
  */
+import { createHash } from 'node:crypto'
 import type { AccountSurface } from './vendor/accountGovernance'
 import type { HostAction, HostIdentityContext, HostIdentitySource } from './vendor/hostIdentity'
 import type { LiveTap } from './liveTap'
@@ -65,7 +66,8 @@ export class TapIdentitySource implements HostIdentitySource {
           permissions: [],
           observedAt: facts.observedAt,
           // 非秘密的登录代号：换号/换达人/换房间/权限变化都会改变它，正常刷新不变。
-          identityRevision: `tap-v2|${facts.buyinAccountId}|${facts.userId}|${room ?? 'no-room'}|live=${authority}`,
+          identityRevision: createHash('sha256').update(JSON.stringify([facts.buyinAccountId, facts.userId,
+            facts.loginUserId ?? null, room, authority])).digest('hex'),
           executionGuard: 'identity_revision_v2',
           evidenceMode: 'platform',
         }

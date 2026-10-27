@@ -1,38 +1,25 @@
 /** Read-only real-page preparation; never calls submit or persists browser storage. */
 import { writeFileSync } from 'node:fs'
 import { LiveTap } from '../electron/main/bridge/liveTap'
+import { collectStableCreatorEvidence } from './probeCreatorObservation'
+import { ProbeRestrictionClient } from './probeRestrictionClient'
 
 const storageStatePath = process.env.LIVE_ASSISTANT_LOGIN_STATE
 const output = process.env.LIVE_ASSISTANT_IDENTITY_PROBE_OUTPUT
 if (!storageStatePath || !output) throw new Error('private_input_and_output_required')
 const tap = new LiveTap({ storageStatePath, executablePath: process.env.TEST_CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe',
   headless: true, identityOnly: true, log: () => {} })
+let gate: ProbeRestrictionClient | null = null
 try {
+  // The running host owns the only writable restriction database. An old/unavailable host
+  // cannot establish that there is no durable stop, so never start a browser in that case.
+  gate = new ProbeRestrictionClient(process.env.LIVE_ASSISTANT_BRIDGE_TOKEN ?? '', Number(process.env.LIVE_ASSISTANT_BRIDGE_PORT ?? '9310'))
+  await gate.assertAllowed()
   await tap.start()
-  if (!tap.loggedIn) {
-    writeFileSync(output, JSON.stringify({ ok: false, observedAt: new Date().toISOString(), reason: 'login_required' }), { mode: 0o600 })
-    console.log(JSON.stringify({ loggedIn: false, requiresHumanLogin: true })); process.exitCode = 2
-  }
-  else {
-    const before = await tap.identityProbeSummary()
-    if (before.restricted) throw new Error('platform_verification_required')
-    const deadline = Date.now() + 12_000
-    while (!tap.facts && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 200))
-    if (!tap.facts) {
-      const summary = await tap.identityProbeSummary()
-      if (summary.restricted) throw new Error('platform_verification_required')
-      writeFileSync(output, JSON.stringify({ ok: false, observedAt: new Date().toISOString(), reason: 'identity_response_not_observed', summary }), { mode: 0o600 })
-      console.log(JSON.stringify({ ok: false, reason: 'identity_response_not_observed', summary }))
-      process.exitCode = 2
-      process.exitCode && await tap.stop()
-      process.exit(process.exitCode)
-    }
-    // Inspect the first page-observed response before making any further request: a creator
-    // may not have the subaccount fields that refreshIdentity currently requires.
-    const context = tap.replyContext()
-    if (!context.facts || !context.identityData) throw new Error('identity_response_not_observed')
-    const challenge = await context.page.locator('iframe[src*="captcha"]:visible,iframe[src*="verifycenter"]:visible,[id*="captcha"]:visible').count()
-    if (challenge) throw new Error('platform_verification_required')
+  {
+    // Wait for a stable observation after SPA navigation, without reloading or requesting
+    // an identity endpoint. The helper discards evidence whenever page/account/room changes.
+    const { context, candidateControls } = await collectStableCreatorEvidence(tap, { checkPlatformGate: () => gate!.assertAllowed() })
     const fields: Record<string, string> = {}, roleValues: Record<string, unknown> = {}
     const walk = (value: unknown, path: string[] = []) => {
       if (path.length > 5 || !value || typeof value !== 'object' || Array.isArray(value)) return
@@ -45,26 +32,20 @@ try {
       }
     }
     walk(context.identityData)
-    await context.page.locator('textarea, input, [contenteditable="true"]').first()
-      .waitFor({ state: 'visible', timeout: 8000 }).catch(() => {})
-    const afterRender = await tap.identityProbeSummary()
-    if (afterRender.restricted) throw new Error('platform_verification_required')
-    if (tap.replyContext().generation !== context.generation) throw new Error('buyin_context_changed')
-    const controls = await context.page.evaluate(() => [...document.querySelectorAll('textarea,input,[contenteditable="true"]')]
-      .filter(el => el.getClientRects().length > 0).map(el => ({ tag: el.tagName, id: el.id,
-        className: el.className, parentId: el.parentElement?.id, parentClass: el.parentElement?.className,
-        type: el.getAttribute('type'), placeholder: el.getAttribute('placeholder') })))
-    const buttons = await context.page.evaluate(() => [...document.querySelectorAll('button,[role="button"]')]
-      .filter(el => el.getClientRects().length > 0 && (el.textContent ?? '').trim() === '发布')
-      .map(el => ({ tag: el.tagName, id: el.id, className: el.className, parentId: el.parentElement?.id,
-        parentClass: el.parentElement?.className, disabled: el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true' })))
     // Private evidence contains stable IDs, never credentials, chat, catalog or raw platform response.
     writeFileSync(output, JSON.stringify({ observedAt: new Date().toISOString(), facts: context.facts,
-      fields, roleValues, controls, buttons, roomId: context.roomId }, null, 2), { mode: 0o600 })
-    console.log(JSON.stringify({ loggedIn: context.loggedIn, fields, roleValues, controls, buttons, privateEvidenceSaved: true }))
+      fields, roleValues, candidateControls, roomId: context.roomId }, null, 2), { mode: 0o600 })
+    console.log(JSON.stringify({ loggedIn: context.loggedIn, fields, roleValues, candidateControls, privateEvidenceSaved: true }))
   }
 } catch (error) {
-  writeFileSync(output, JSON.stringify({ ok: false, observedAt: new Date().toISOString(), reason: 'probe_failed' }), { mode: 0o600 })
-  console.log(JSON.stringify({ ok: false, reason: error instanceof Error && /^[a-z_]+$/.test(error.message) ? error.message : 'probe_failed' }))
+  let reason = error instanceof Error && /^[a-z_]+$/.test(error.message) ? error.message : 'probe_failed'
+  // A restriction seen by this separate browser must be persisted by the host before the
+  // operator can resume any work. Reporting failure remains visible and never retried.
+  if (tap.restrictionCode) {
+    try { if (!gate) throw new Error('host_restriction_gate_unavailable'); await gate.report(tap.restrictionCode) }
+    catch { reason = 'host_restriction_report_failed' }
+  }
+  writeFileSync(output, JSON.stringify({ ok: false, observedAt: new Date().toISOString(), reason }), { mode: 0o600 })
+  console.log(JSON.stringify({ ok: false, reason }))
   process.exitCode = 2
 } finally { await tap.stop() }

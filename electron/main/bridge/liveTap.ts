@@ -17,6 +17,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { chromium, type Browser, type BrowserContext, type Page, type Request } from 'playwright'
 import { HostIdentityError } from './vendor/hostIdentity'
+import { type PlatformRestrictionStore, type PlatformStopCode } from './platformRestrictionStore'
 
 export interface TapCommentEvent {
   roomId: string
@@ -49,6 +50,9 @@ export interface TapOptions {
   bufferSize?: number
   /** Identity preparation must not start a second live-comment/analytics collector. */
   identityOnly?: boolean
+  /** Shared private store, supplied by the production host before any browser starts. */
+  restrictionStore?: PlatformRestrictionStore
+  onRestriction?: () => void
   log?: (message: string) => void
 }
 
@@ -88,7 +92,7 @@ export class LiveTap {
    * 从 `/index/getUser` 读到的真实身份事实。业务侧绑账号要用稳定 ID，
    * 所以必须给出真实值（仅回环 + Bearer token 可读），不能只给掩码。
    */
-  facts: { userId: string | null; originUid: string | null; buyinAccountId: string | null; drAuth: unknown; observedAt: string } | null = null
+  facts: { userId: string | null; originUid: string | null; buyinAccountId: string | null; loginUserId?: string | null; drAuth: unknown; observedAt: string } | null = null
   private catalogSignature = ''
   private pageGeneration = 0
   private identityUrl: string | null = null
@@ -97,12 +101,13 @@ export class LiveTap {
   private playinfoUrl: string | null = null
   private roomObservedAt = 0
   /** Latched until the operator explicitly rebuilds the host after investigating the restriction. */
-  private platformStop: string | null = null
+  private platformStop: PlatformStopCode | 'host_restriction_store_unavailable' | null = null
   errors: string[] = []
   startedAt: string | null = null
 
   constructor(options: TapOptions) {
     this.options = { ...DEFAULTS, bufferSize: 300, ...options } as never
+    this.platformStop = options.restrictionStore?.read() ?? null
   }
 
   private log(message: string) {
@@ -114,6 +119,9 @@ export class LiveTap {
   markPlatformRestriction(code: 'host_login_expired' | 'host_permission_denied' | 'host_rate_limited' | 'host_platform_restricted'): void {
     if (this.platformStop) return
     this.platformStop = code
+    try { this.options.restrictionStore?.record(code) }
+    catch { this.platformStop = 'host_restriction_store_unavailable' }
+    try { this.options.onRestriction?.() } catch { /* the stop remains latched */ }
     const page = this.consolePage
     this.invalidatePage()
     // The page is an owned collector page; closing it stops its own recurring polling too.
@@ -203,6 +211,7 @@ export class LiveTap {
   }
 
   async start(): Promise<void> {
+    this.requirePlatformAvailable()
     if (!existsSync(this.options.storageStatePath)) throw new Error('tap_storage_state_missing')
     const storageState = JSON.parse(readFileSync(this.options.storageStatePath, 'utf8'))
     this.browser = await chromium.launch({
@@ -242,7 +251,7 @@ export class LiveTap {
     page.on('framenavigated', frame => {
       if (frame === page.mainFrame()) {
         this.invalidatePage()
-        if (this.identityUrl && !this.platformStop) void this.refreshIdentity().catch(() => {})
+        if (this.identityUrl && !this.platformStop && !this.options.identityOnly) void this.refreshIdentity().catch(() => {})
       }
     })
     page.on('close', () => this.invalidatePage())
@@ -298,12 +307,15 @@ export class LiveTap {
           if (generation !== this.pageGeneration || page.isClosed()) return
           const data = body?.data ?? {}
           const nextAccount = data.user_id ? String(data.user_id) : null
+          const nextLoginUser = data.login_user_id ? String(data.login_user_id) : null
           this.identityData = data
-          if (this.facts && (this.facts.userId !== nextAccount || this.facts.buyinAccountId !== (data.buyin_account_id ? String(data.buyin_account_id) : null))) this.observeRoom(null)
+          if (this.facts && (this.facts.userId !== nextAccount || this.facts.buyinAccountId !== (data.buyin_account_id ? String(data.buyin_account_id) : null)
+            || (this.facts.loginUserId ?? null) !== nextLoginUser)) this.observeRoom(null)
           this.facts = {
             userId: data.user_id ? String(data.user_id) : null,
             originUid: data.origin_uid ? String(data.origin_uid) : null,
             buyinAccountId: data.buyin_account_id ? String(data.buyin_account_id) : null,
+            loginUserId: nextLoginUser,
             drAuth: data.dr_auth ?? null,
             observedAt: new Date().toISOString(),
           }
@@ -343,9 +355,11 @@ export class LiveTap {
         const loggedIn = await this.detectLogin()
         if (generation !== this.pageGeneration || page.isClosed()) return
         if (this.facts && (this.facts.userId !== String(data.user_id)
-          || this.facts.buyinAccountId !== String(data.buyin_account_id))) this.observeRoom(null)
+          || this.facts.buyinAccountId !== String(data.buyin_account_id)
+          || (this.facts.loginUserId ?? null) !== (data.login_user_id ? String(data.login_user_id) : null))) this.observeRoom(null)
         this.facts = { userId: String(data.user_id), originUid: data.origin_uid ? String(data.origin_uid) : null,
-          buyinAccountId: String(data.buyin_account_id), drAuth: data.dr_auth ?? null, observedAt: new Date().toISOString() }
+          buyinAccountId: String(data.buyin_account_id), loginUserId: data.login_user_id ? String(data.login_user_id) : null,
+          drAuth: data.dr_auth ?? null, observedAt: new Date().toISOString() }
         this.identityData = data
         this.loggedIn = loggedIn
       } catch {
