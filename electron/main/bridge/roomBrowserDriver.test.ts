@@ -4,6 +4,32 @@ import { createServer } from 'node:http'
 import { chromium } from 'playwright'
 import { RoomBrowserDriver } from './roomBrowserDriver'
 
+test('preflight stays readable when renderer evaluation never resolves', async () => {
+  const driver = new RoomBrowserDriver({ profileDir: 'synthetic', executablePath: '', capturePaths: [],
+    anchorName: 'synthetic', expectedOwnerId: 'owner', expectedExecutorId: 'assistant' })
+  let evaluations = 0
+  Object.assign(driver, { roomPage: { evaluate: () => { evaluations++; return new Promise(() => {}) } } })
+  const info = await driver.inspect()
+  assert.equal(evaluations, 0)
+  assert.equal(info.loggedIn, false)
+  assert.equal(info.controls, null)
+})
+
+test('failed refresh clears cached identities and advances both generations', async () => {
+  const driver = new RoomBrowserDriver({ profileDir: 'synthetic', executablePath: '', capturePaths: [],
+    anchorName: 'synthetic', expectedOwnerId: 'owner', expectedExecutorId: 'assistant' })
+  const page = { isClosed: () => false, waitForResponse: async () => { throw new Error('timeout') }, goto: async () => {} }
+  Object.assign(driver, { selfPage: page, roomPage: page, self: { id: 'assistant', at: Date.now() },
+    room: { at: Date.now(), value: { ownerId: 'owner', roomId: 'synthetic', live: true, adminIds: ['assistant'] } } })
+  await assert.rejects(() => driver.refresh(), /bridge_reply_self_response_unavailable/)
+  const info = await driver.inspect()
+  assert.equal(info.loggedIn, false)
+  assert.equal(info.ownerMatches, false)
+  assert.equal(info.observedAt, null)
+  assert.equal(info.refreshFailure, 'bridge_reply_self_response_unavailable')
+  assert.deepEqual((driver as unknown as { generations: unknown }).generations, { self: 1, room: 1 })
+})
+
 test('real DOM SVG submission fires once, and changed text/disabled control fail before clicking', async () => {
   const server = createServer((_request, response) => response.end(`<div id="input" contenteditable="true"></div><svg id="send" width="40" height="40" type="button"></svg><script>window.sends=0;document.querySelector('#send').addEventListener('click',()=>window.sends++)</script>`))
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))

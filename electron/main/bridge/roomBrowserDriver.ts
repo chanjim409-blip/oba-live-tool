@@ -27,6 +27,7 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
   private room: { value: RoomEvidence; at: number } | null = null
   private generations = { self: 0, room: 0 }
   private pending: Promise<void> | null = null
+  private refreshFailure: string | null = null
   private restricted = false
   private roomDiagnostic: Record<string, unknown> | null = null
   private attachedBrowser: Browser | null = null
@@ -115,32 +116,47 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
     if (this.pending) return this.pending
     const pages = [this.selfPage, this.roomPage]
     if (pages.some(page => !page || page.isClosed())) throw new Error('room_browser_closed')
+    this.refreshFailure = null
     this.pending = (async () => {
       // Only the site's own navigation generates authentication/room requests; no guessed signed HTTP endpoint.
       const targets = ['https://www.douyin.com/user/self?from_nav=1', this.url]
       await Promise.all(pages.map(async (page, i) => {
         const responsePath = i === 0 ? '/aweme/v1/web/user/profile/self/' : '/webcast/room/web/enter/'
+        const surface = i === 0 ? 'self' : 'room'
         const response = page!.waitForResponse(r => new URL(r.url()).pathname === responsePath, { timeout: 12_000 })
+          .catch(() => { throw new Error(`bridge_reply_${surface}_response_unavailable`) })
         const navigation = page!.goto(targets[i], { waitUntil: 'domcontentloaded', timeout: 12_000 })
+          .catch(() => { throw new Error(`bridge_reply_${surface}_navigation_failed`) })
         await Promise.all([response, navigation])
       }))
       // Response listeners await JSON decoding. Wait only for bounded observations, never for a send.
       const end = Date.now() + 2000
       while ((!this.self || !this.room) && Date.now() < end && !this.restricted) await new Promise(resolve => setTimeout(resolve, 25))
-    })().finally(() => { this.pending = null })
+      if (this.restricted) throw new Error('bridge_reply_platform_restricted')
+      if (!this.self || !this.room) throw new Error('bridge_reply_identity_unavailable')
+    })().catch(error => {
+      this.refreshFailure = error instanceof Error ? error.message : 'bridge_reply_refresh_failed'
+      // Late responses from the failed refresh cannot restore apparently valid identity.
+      this.generations.self++
+      this.generations.room++
+      this.self = null
+      this.room = null
+      throw error
+    }).finally(() => { this.pending = null })
     return this.pending
   }
 
-  async inspect() {
+  async inspect(includeControls = false) {
     const room = this.room?.value
-    const controls = await this.roomPage?.evaluate(() => ({
+    // Routine health/preflight must remain readable even when a renderer is stuck.
+    const controls = includeControls ? await this.roomPage?.evaluate(() => ({
       inputs: [...document.querySelectorAll('textarea,[contenteditable="true"]')].map(x => ({
         tag: x.tagName, id: x.id, className: x.className, placeholder: x.getAttribute('placeholder'),
         dataE2e: x.getAttribute('data-e2e'), role: x.getAttribute('role') })),
       submit: [...document.querySelectorAll('button,[role="button"]')]
         .filter(x => x.textContent?.trim() === '发送').map(x => ({ tag: x.tagName, id: x.id,
           className: x.className, dataE2e: x.getAttribute('data-e2e') })),
-    })).catch(() => null)
+    })).catch(() => null) : null
     if (this.ownedPid) await ownedBrowserWindows(this.ownedPid, this.config.profileDir, false)
     return { transport: this.ownedPid ? 'hidden_owned_browser' : 'headless_browser', desktopVisible: false, roomUrl: this.url,
       loggedIn: this.self?.id === this.config.expectedExecutorId,
@@ -151,7 +167,7 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
       restricted: this.restricted,
       selectorsConfigured: !!this.config.inputSelector && !!this.config.submitSelector,
       observedAt: this.room ? new Date(this.room.at).toISOString() : null,
-      diagnostic: this.roomDiagnostic, controls }
+      refreshFailure: this.refreshFailure, diagnostic: this.roomDiagnostic, controls }
   }
 
   async snapshot(signal?: AbortSignal): Promise<ReplySnapshot> {
