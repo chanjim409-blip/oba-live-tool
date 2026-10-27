@@ -201,6 +201,11 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
         json(200, replyDriver ? await replyDriver.inspect() : { transport: null, ready: false, reason: 'reply_browser_unavailable' })
         return
       }
+      if (request.method === 'GET' && url.pathname === '/reply/diagnostics') {
+        if (!replyDriver) { json(409, { error_code: 'bridge_reply_unavailable' }); return }
+        json(200, await replyDriver.diagnoseControls())
+        return
+      }
       if (request.method === 'POST' && ['/reply/manual-verification/open', '/reply/manual-verification/complete'].includes(url.pathname)) {
         if (!replyDriver || !replySource) { json(409, { error_code: 'bridge_reply_unavailable' }); return }
         const body = await readJson(request)

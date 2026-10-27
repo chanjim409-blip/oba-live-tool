@@ -34,6 +34,7 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
   private ownedPid: number | null = null
   private manualState: 'none' | 'opening' | 'manual' | 'checking' | 'blocked' = 'none'
   private manualWindowVisible = false
+  private manualFailure: string | null = null
   get manualVerificationActive(): boolean { return this.manualState !== 'none' }
   constructor(private readonly config: RoomBrowserConfig) {}
 
@@ -60,6 +61,7 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
     if (this.manualState === 'manual') return
     if (this.manualState === 'opening' || this.manualState === 'checking') throw new Error('bridge_manual_busy')
     this.manualState = 'opening'
+    this.manualFailure = null
     this.clearObservations()
     try {
       await this.pending?.catch(() => undefined)
@@ -75,6 +77,7 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
       await this.roomPage!.goto(this.url, { waitUntil: 'domcontentloaded', timeout: 12_000 })
       await this.roomPage!.bringToFront()
     } catch (error) {
+      this.manualFailure = 'bridge_manual_open_failed'
       // A slow page may still be usable by the person; do not reopen/refresh it automatically.
       this.manualState = this.manualWindowVisible ? 'manual' : 'blocked'
       throw error
@@ -84,6 +87,7 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
   async completeManualVerification(): Promise<void> {
     if (this.manualState !== 'manual') throw new Error('bridge_manual_not_open')
     this.manualState = 'checking'
+    this.manualFailure = null
     try {
       await this.context!.close()
       this.context = null
@@ -93,13 +97,23 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
       // Only the explicit human-completed operation clears the old latch; fresh checks can relatch it.
       this.restricted = false
       await this.refresh(true)
-      const seen = await this.snapshot(undefined, true)
-      if (seen.blocked || !seen.live || !seen.admin || !seen.canSend
-        || seen.ownerId !== this.config.expectedOwnerId || seen.executorId !== this.config.expectedExecutorId) {
-        throw new Error('bridge_manual_recheck_failed')
+      // Room identity responses can arrive before React mounts the chat composer.
+      if (this.config.inputSelector) {
+        await this.roomPage!.locator(this.config.inputSelector).waitFor({ state: 'visible', timeout: 5000 }).catch(() => undefined)
       }
+      const seen = await this.snapshot(undefined, true)
+      if (seen.blocked) throw new Error('bridge_manual_platform_restricted')
+      if (!seen.live) throw new Error('bridge_manual_room_not_live')
+      if (seen.ownerId !== this.config.expectedOwnerId || seen.executorId !== this.config.expectedExecutorId) throw new Error('bridge_manual_identity_mismatch')
+      if (!seen.admin) throw new Error('bridge_manual_admin_unproven')
+      if (!seen.canSend) throw new Error('bridge_manual_controls_unavailable')
       this.manualState = 'none'
-    } catch (error) { this.manualState = 'blocked'; this.restricted = true; throw error }
+    } catch (error) {
+      this.manualState = 'blocked'
+      this.manualFailure = error instanceof Error && /^bridge_[a-z_]+$/.test(error.message) ? error.message : 'bridge_manual_recheck_failed'
+      // Keep execution blocked, but never manufacture a platform restriction from a local error.
+      throw error
+    }
   }
 
   async start(): Promise<void> {
@@ -228,7 +242,7 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
     })).catch(() => null) : null
     if (this.ownedPid) await ownedBrowserWindows(this.ownedPid, this.config.profileDir, false)
     return { transport: this.manualState === 'manual' ? 'manual_verification' : this.ownedPid ? 'hidden_owned_browser' : 'headless_browser',
-      desktopVisible: this.manualWindowVisible, manualState: this.manualState, roomUrl: this.url,
+      desktopVisible: this.manualWindowVisible, manualState: this.manualState, manualFailure: this.manualFailure, roomUrl: this.url,
       loggedIn: this.self?.id === this.config.expectedExecutorId,
       ownerMatches: room?.ownerId === this.config.expectedOwnerId,
       live: room?.live ?? false, roomId: room?.live ? room.roomId : null,
@@ -238,6 +252,29 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
       selectorsConfigured: !!this.config.inputSelector && !!this.config.submitSelector,
       observedAt: this.room ? new Date(this.room.at).toISOString() : null,
       refreshFailure: this.refreshFailure, diagnostic: this.roomDiagnostic, controls }
+  }
+
+  /** Local DOM inspection only: no navigation, text extraction, credential output or interaction. */
+  async diagnoseControls() {
+    const page = this.roomPage
+    if (!page || page.isClosed()) return { available: false, reason: 'room_page_unavailable' }
+    const work = async () => {
+      const challengeCount = await page.locator('iframe[src*="captcha"]:visible,iframe[src*="verifycenter"]:visible,[id*="captcha"]:visible').count()
+      const input = this.config.inputSelector ? page.locator(this.config.inputSelector) : null
+      const submit = this.config.submitSelector ? page.locator(this.config.submitSelector) : null
+      const inputCount = input ? await input.count() : 0
+      const submitCount = submit ? await submit.count() : 0
+      return { available: true, challengeCount, inputCount, submitCount,
+        inputVisible: inputCount === 1 && await input!.isVisible(),
+        inputEditable: inputCount === 1 && await input!.isEditable(),
+        submitVisible: submitCount === 1 && await submit!.isVisible() }
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([work(), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('bridge_diagnostics_timeout')), 2000)
+      })])
+    } finally { clearTimeout(timer) }
   }
 
   async snapshot(signal?: AbortSignal, completingManual = false): Promise<ReplySnapshot> {

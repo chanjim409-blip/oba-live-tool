@@ -24,7 +24,8 @@ test('manual handoff closes the owned context first, blocks sends/refresh, and s
   assert.equal(submits, 0)
   await assert.rejects(() => driver.completeManualVerification()) // no new platform evidence in this fake
   assert.equal((await driver.inspect()).manualState, 'blocked')
-  assert.equal((await driver.inspect()).restricted, true)
+  assert.equal((await driver.inspect()).restricted, false, 'local recheck failure must not fabricate platform restriction')
+  assert.equal((await driver.inspect()).manualFailure, 'bridge_manual_recheck_failed')
   await assert.rejects(() => driver.snapshot(), /manual_verification_active/)
 })
 
@@ -41,6 +42,31 @@ test('manual completion returns to background only after fresh identity checks a
   assert.equal(info.manualState, 'none')
   assert.equal(info.desktopVisible, false)
   await assert.rejects(() => driver.completeManualVerification(), /manual_not_open/)
+})
+
+test('missing composer is a local block, not a platform restriction', async () => {
+  const driver = new RoomBrowserDriver({ profileDir: 'synthetic', executablePath: '', capturePaths: [],
+    anchorName: 'synthetic', expectedOwnerId: 'owner', expectedExecutorId: 'assistant' })
+  Object.assign(driver, { manualState: 'manual', context: { close: async () => {} },
+    launchOwnedContext: async () => {}, refresh: async () => {},
+    snapshot: async () => ({ blocked: false, live: true, admin: true, canSend: false, ownerId: 'owner', executorId: 'assistant' }) })
+  await assert.rejects(() => driver.completeManualVerification(), /controls_unavailable/)
+  const info = await driver.inspect()
+  assert.equal(info.manualState, 'blocked')
+  assert.equal(info.manualFailure, 'bridge_manual_controls_unavailable')
+  assert.equal(info.restricted, false)
+  assert.equal(driver.manualVerificationActive, true)
+})
+
+test('control diagnostics return counts/booleans only and do not refresh the page', async () => {
+  const driver = new RoomBrowserDriver({ profileDir: 'synthetic', executablePath: '', capturePaths: [],
+    anchorName: 'synthetic', expectedOwnerId: 'owner', expectedExecutorId: 'assistant', inputSelector: '#input', submitSelector: '#send' })
+  Object.assign(driver, { roomPage: { isClosed: () => false, locator: (selector: string) => ({
+    count: async () => selector === '#input' || selector === '#send' ? 1 : 0,
+    isVisible: async () => true, isEditable: async () => true,
+  }) } })
+  assert.deepEqual(await driver.diagnoseControls(), { available: true, challengeCount: 0, inputCount: 1, submitCount: 1,
+    inputVisible: true, inputEditable: true, submitVisible: true })
 })
 
 test('preflight stays readable when renderer evaluation never resolves', async () => {
