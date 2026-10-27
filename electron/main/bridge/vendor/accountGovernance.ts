@@ -1,6 +1,4 @@
-// VENDORED — 由业务仓 live-assistant-lite 的 contracts/accountGovernance.ts 原样复制，仅改写相对导入。
-// 业务仓提交：见 docs/BRIDGE_INTEGRATION.md。上游/本仓许可：MIT（保留原版权声明）。
-// 不要在这里单独改逻辑：改动请回到业务仓，再重新 vendor。
+// VENDORED from live-assistant-lite; update source first. MIT.
 import { z } from "zod";
 
 const id = z.string().trim().min(1).max(200);
@@ -8,6 +6,7 @@ export const accountSurfaceSchema = z.enum(["douyin_room", "buyin"]);
 export type AccountSurface = z.infer<typeof accountSurfaceSchema>;
 export const accountBindingSchema = z.strictObject({
   expectedRevision: z.number().int().nonnegative(),
+  executionMode: z.enum(["assistant", "creator_buyin"]).optional(),
   assistantId: id,
   buyinOperatorId: id,
   roomAdminEvidence: z.enum(["unverified", "user_confirmed"]),
@@ -27,7 +26,7 @@ export const identityObservationSchema = z.strictObject({
   surface: accountSurfaceSchema,
   executorId: id,
   loginState: z.enum(["authenticated", "expired", "logged_out", "unknown"]),
-  role: z.enum(["room_admin", "buyin_subaccount", "unknown"]),
+  role: z.enum(["room_admin", "buyin_subaccount", "creator", "unknown"]),
   roleVerified: z.boolean(),
   permissions: z.array(z.enum(["reply", "popup", "block", "unblock"])).max(4),
   observedAt: z.iso.datetime(),
@@ -38,6 +37,7 @@ export const identityObservationSchema = z.strictObject({
 export type IdentityObservation = z.infer<typeof identityObservationSchema>;
 
 export interface AccountBinding {
+  executionMode?: "assistant" | "creator_buyin";
   sessionId: string; platform: string; accountId: string; roomId: string;
   assistantId: string; buyinOperatorId: string;
   roomAdminEvidence: "unverified" | "user_confirmed";
@@ -48,6 +48,18 @@ export interface AccountBinding {
 
 /** 绑定里声明的核验面；没声明就是两面都要（保持旧行为）。 */
 export function bindingSurfaces(binding: AccountBinding | null | undefined): AccountSurface[] {
+  if (binding?.executionMode === "creator_buyin") return ["buyin"];
   const declared = (binding?.surfaces ?? []).filter((surface): surface is AccountSurface => surface === "douyin_room" || surface === "buyin");
   return declared.length > 0 ? declared : ["douyin_room", "buyin"];
+}
+
+export function actionSurface(binding: AccountBinding | null, kind: string): AccountSurface {
+  return kind === "popup" || (kind === "reply" && binding?.executionMode === "creator_buyin") ? "buyin" : "douyin_room";
+}
+
+/** Host-side role/action compatibility, in addition to the business binding and explicit permissions. */
+export function roleAllowsAction(role: IdentityObservation["role"], surface: AccountSurface, kind: string): boolean {
+  if (role === "creator") return surface === "buyin" && (kind === "reply" || kind === "popup");
+  return surface === "buyin" ? role === "buyin_subaccount" && kind === "popup"
+    : role === "room_admin" && ["reply", "block", "unblock"].includes(kind);
 }

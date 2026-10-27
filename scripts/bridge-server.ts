@@ -18,6 +18,7 @@ import { mkdirSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { startBridgeServer } from '../electron/main/bridge/bridgeServer'
 import type { RoomBrowserConfig } from '../electron/main/bridge/roomBrowserDriver'
+import type { BuyinReplyConfig } from '../electron/main/bridge/buyinReplyDriver'
 
 const token = (process.env.LIVE_ASSISTANT_BRIDGE_TOKEN ?? '').trim()
 if (token.length < 32) {
@@ -47,6 +48,9 @@ const server = await startBridgeServer({
   storageStatePath,
   executablePath,
   replyBrowser,
+  buyinReply: process.env.LIVE_ASSISTANT_BUYIN_REPLY_CONFIG
+    ? JSON.parse(readFileSync(process.env.LIVE_ASSISTANT_BUYIN_REPLY_CONFIG, 'utf8').replace(/^\uFEFF/, '')) as BuyinReplyConfig : undefined,
+  buyinReplyExecutionEnabled: process.env.LIVE_ASSISTANT_BUYIN_REPLY_ENABLED === '1',
   replyExecutionEnabled: process.env.LIVE_ASSISTANT_REPLY_ENABLED === '1',
   headless: process.env.LIVE_ASSISTANT_BRIDGE_HEADLESS !== '0',
   allowedOrigins: (process.env.LIVE_ASSISTANT_BRIDGE_ORIGINS ?? '').split(',').map((item) => item.trim()).filter(Boolean),

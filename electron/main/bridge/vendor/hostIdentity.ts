@@ -1,12 +1,10 @@
-// VENDORED — 由业务仓 live-assistant-lite 的 src/platform/hostIdentity.ts 原样复制，仅改写相对导入。
-// 业务仓提交：见 docs/BRIDGE_INTEGRATION.md。上游/本仓许可：MIT（保留原版权声明）。
-// 不要在这里单独改逻辑：改动请回到业务仓，再重新 vendor。
+// VENDORED from live-assistant-lite; update source first. MIT.
 /** Embeddable Electron host boundary. Does not launch a browser or listen on a port. */
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
-import { identityObservationSchema, type AccountSurface, type IdentityObservation } from "./accountGovernance";
+import { identityObservationSchema, roleAllowsAction, type AccountSurface, type IdentityObservation } from "./accountGovernance";
 import type { Receipt, Scope } from "./contracts";
-import type { HostBridgeDb as Db } from "../sqliteDb"
+import type { HostBridgeDb as Db } from "../sqliteDb";
 
 const id = z.string().trim().min(1).max(200);
 const scopeSchema = z.strictObject({ platform: id, accountId: id, roomId: id, sessionId: id });
@@ -110,7 +108,7 @@ export class HostIdentityBoundary {
         return await this.deps.source.withContext(action.identityGuard.surface, async ctx => {
           const seen = await this.read(ctx, scope, action.identityGuard.surface, signal);
           if (seen.executorId !== action.identityGuard.executorId || seen.loginState !== "authenticated" || !seen.roleVerified
-            || seen.role !== (action.kind === "popup" ? "buyin_subaccount" : "room_admin") || !seen.permissions.includes(action.kind) || !ctx.reconcile) return stored;
+            || !roleAllowsAction(seen.role, action.identityGuard.surface, action.kind) || !seen.permissions.includes(action.kind) || !ctx.reconcile) return stored;
           // The login may have been rebuilt. Reconciliation is read-only and scoped to the saved original action.
           const receipt = this.normalise(await ctx.reconcile(action, signal), stored, row.evidence_mode);
           if (signal?.aborted) return stored;
@@ -139,13 +137,13 @@ export class HostIdentityBoundary {
       const key = hash([scopeOf(action), action.actionId]);
       try {
         assertCurrentRequest();
-        return await this.deps.source.withContext(action.kind === "popup" ? "buyin" : "douyin_room", async ctx => {
-          const surface = action.kind === "popup" ? "buyin" : "douyin_room";
+        return await this.deps.source.withContext(action.identityGuard.surface, async ctx => {
+          const surface = action.identityGuard.surface;
           const seen = await this.read(ctx, scopeOf(action), surface, signal);
           assertCurrentRequest();
           const g = action.identityGuard;
           if (g.surface !== surface || seen.executorId !== g.executorId || seen.identityRevision !== g.identityRevision) throw new HostIdentityError("host_identity_changed");
-          if (seen.loginState !== "authenticated" || !seen.roleVerified || seen.role !== (surface === "buyin" ? "buyin_subaccount" : "room_admin") || !seen.permissions.includes(action.kind)) throw new HostIdentityError("host_permission_denied");
+          if (seen.loginState !== "authenticated" || !seen.roleVerified || !roleAllowsAction(seen.role, surface, action.kind) || !seen.permissions.includes(action.kind)) throw new HostIdentityError("host_permission_denied");
           if (!this.deps.executionEnabled) throw new HostIdentityError("host_execution_disabled");
           if ((action.kind === "popup" && !action.productId) || (action.kind === "reply" && !action.text?.trim()) || (["block", "unblock"].includes(action.kind) && !action.userId)) throw new HostIdentityError("host_target_missing");
           const fingerprint = hash([scopeOf(action), action.kind, action.text, action.productId, action.userId]);

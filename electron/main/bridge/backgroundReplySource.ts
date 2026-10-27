@@ -10,6 +10,7 @@ export interface ReplySnapshot {
   executorId: string
   live: boolean
   admin: boolean
+  creator?: boolean
   canSend: boolean
   blocked: boolean
   generation: string
@@ -40,13 +41,13 @@ export class BackgroundReplySource implements HostIdentitySource {
   }
   constructor(private readonly driver: BackgroundReplyDriver,
     private readonly scope: () => RegisteredScope | null,
-    private readonly expected: { ownerId: string; executorId: string; minIntervalMs: number },
+    private readonly expected: { ownerId: string; executorId: string; minIntervalMs: number; surface?: AccountSurface },
     private readonly now: () => number = Date.now) {
     if (!expected.ownerId || !expected.executorId || expected.minIntervalMs < 5000) throw new Error('reply_configuration_invalid')
   }
 
   async withContext<T>(surface: AccountSurface, run: (context: HostIdentityContext) => Promise<T>): Promise<T> {
-    if (surface !== 'douyin_room') throw new HostIdentityError('host_surface_unprovisioned')
+    if (surface !== (this.expected.surface ?? 'douyin_room')) throw new HostIdentityError('host_surface_unprovisioned')
     const scope = this.scope()
     if (!scope) throw new HostIdentityError('host_session_not_registered')
     let pinned: ReplySnapshot | null = null
@@ -63,9 +64,10 @@ export class BackgroundReplySource implements HostIdentitySource {
       assertCurrent(signal)
       if (seen.blocked) { this.halted = true; throw new HostIdentityError('host_platform_restricted') }
       if (seen.ownerId !== this.expected.ownerId || seen.executorId !== this.expected.executorId
+        || (surface === 'buyin' && seen.ownerId !== scope.accountId)
         || seen.roomId !== scope.roomId || !seen.live) throw new HostIdentityError('host_scope_mismatch')
       if (this.now() - seen.observedAt < 0 || this.now() - seen.observedAt > 30_000) throw new HostIdentityError('host_identity_stale')
-      if (!seen.admin || !seen.canSend) throw new HostIdentityError('host_permission_denied')
+      if (!(surface === 'buyin' ? seen.creator === true : seen.admin) || !seen.canSend) throw new HostIdentityError('host_permission_denied')
       if (pinned && pinned.generation !== seen.generation) throw new HostIdentityError('host_context_changed')
       pinned = seen
       return seen
@@ -74,7 +76,7 @@ export class BackgroundReplySource implements HostIdentitySource {
       read: async signal => {
         const seen = await check(signal)
         const observation: IdentityObservation = { ...scope, surface, executorId: seen.executorId,
-          loginState: 'authenticated', role: 'room_admin', roleVerified: true, permissions: ['reply'],
+          loginState: 'authenticated', role: surface === 'buyin' ? 'creator' : 'room_admin', roleVerified: true, permissions: ['reply'],
           observedAt: new Date(seen.observedAt).toISOString(),
           identityRevision: createHash('sha256').update(JSON.stringify([seen.generation, seen.ownerId, seen.executorId, seen.roomId])).digest('hex'),
           executionGuard: 'identity_revision_v2', evidenceMode: 'platform' }

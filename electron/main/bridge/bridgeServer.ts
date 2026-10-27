@@ -26,6 +26,7 @@ import { TapIdentitySource, type RegisteredScope } from './tapIdentitySource'
 import { ScopeGuard, parseScope } from './scopeGuard'
 import { RoomBrowserDriver, type RoomBrowserConfig } from './roomBrowserDriver'
 import { BackgroundReplySource } from './backgroundReplySource'
+import { BuyinReplyDriver, type BuyinReplyConfig } from './buyinReplyDriver'
 
 export interface BridgeServerConfig {
   port: number
@@ -47,6 +48,8 @@ export interface BridgeServerConfig {
   /** Explicit private room configuration; omitted preserves the read-only bridge. */
   replyBrowser?: RoomBrowserConfig
   replyExecutionEnabled?: boolean
+  buyinReply?: BuyinReplyConfig
+  buyinReplyExecutionEnabled?: boolean
   log?: (message: string) => void
   /** Dependency injection for offline contract tests; production uses LiveTap. */
   tapFactory?: (options: ConstructorParameters<typeof LiveTap>[0]) => LiveTap
@@ -108,9 +111,19 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
   const replySource = replyDriver && config.replyBrowser ? new BackgroundReplySource(replyDriver, () => scopeGuard.current,
     { ownerId: config.replyBrowser.expectedOwnerId, executorId: config.replyBrowser.expectedExecutorId, minIntervalMs: 15_000 }) : null
   const readSource = config.identitySource ?? (tap ? new TapIdentitySource(tap, () => scopeGuard.current) : refusingIdentitySource)
+  const buyinDriver = tap && config.buyinReply ? new BuyinReplyDriver(tap, config.buyinReply) : null
+  const buyinSource = buyinDriver && config.buyinReply ? new BackgroundReplySource(buyinDriver, () => scopeGuard.current,
+    { ownerId: config.buyinReply.expectedOwnerId, executorId: config.buyinReply.expectedExecutorId, minIntervalMs: 15_000, surface: 'buyin' }) : null
   const source: HostIdentitySource = {
     withContext: (surface, run) => surface === 'douyin_room' && replySource
-      ? replySource.withContext(surface, run) : readSource.withContext(surface, run),
+      ? replySource.withContext(surface, async context => run({ ...context, execute: async (action, signal) => {
+        if (config.replyExecutionEnabled !== true) throw new Error('host_execution_disabled')
+        return context.execute(action, signal)
+      } })) : surface === 'buyin' && buyinSource
+        ? buyinSource.withContext(surface, async context => run({ ...context, execute: async (action, signal) => {
+          if (config.buyinReplyExecutionEnabled !== true) throw new Error('host_execution_disabled')
+          return context.execute(action, signal)
+        } })) : readSource.withContext(surface, run),
   }
   const boundary = new HostIdentityBoundary({
     db: opened.db,
@@ -118,7 +131,7 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
     source,
     now: () => Date.now(),
     mode: 'platform',
-    executionEnabled: !!replySource && config.replyExecutionEnabled === true,
+    executionEnabled: (!!replySource && config.replyExecutionEnabled === true) || (!!buyinSource && config.buyinReplyExecutionEnabled === true),
   })
   const identityHandler = createHostIdentityHandler(boundary, {
     token: config.token,
@@ -186,7 +199,9 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
         if (tap && !tap.loggedIn) await tap.refreshIdentity()
         json(200, { ok: true, bridge: 'live-assistant-host', ...(tap ? tap.status() : { logged_in: false, live: false }),
           reply_transport: replyDriver ? (config.replyBrowser?.attachedEndpoint ? 'hidden_owned_browser' : 'headless_browser') : null,
-          reply_execution_enabled: !!replySource && config.replyExecutionEnabled === true && !replyDriver?.manualVerificationActive })
+          reply_execution_enabled: !!replySource && config.replyExecutionEnabled === true && !replyDriver?.manualVerificationActive,
+          buyin_reply_configured: !!buyinDriver,
+          buyin_reply_execution_enabled: !!buyinSource && config.buyinReplyExecutionEnabled === true })
         return
       }
 
@@ -199,6 +214,15 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
 
       if (request.method === 'GET' && url.pathname === '/reply/preflight') {
         json(200, replyDriver ? await replyDriver.inspect() : { transport: null, ready: false, reason: 'reply_browser_unavailable' })
+        return
+      }
+      if (request.method === 'GET' && url.pathname === '/buyin-reply/preflight') {
+        if (!buyinDriver || !config.buyinReply) { json(409, { error_code: 'buyin_reply_unconfigured' }); return }
+        const seen = await buyinDriver.snapshot()
+        json(200, { transport: 'buyin_headless_browser', live: seen.live, canSend: seen.canSend,
+          creatorVerified: seen.creator === true, ownerMatches: seen.ownerId === config.buyinReply.expectedOwnerId,
+          executorMatches: seen.executorId === config.buyinReply.expectedExecutorId, blocked: seen.blocked,
+          observedAt: new Date(seen.observedAt).toISOString(), executionEnabled: config.buyinReplyExecutionEnabled === true })
         return
       }
       if (request.method === 'GET' && url.pathname === '/reply/diagnostics') {

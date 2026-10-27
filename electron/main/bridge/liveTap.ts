@@ -90,6 +90,9 @@ export class LiveTap {
   private pageGeneration = 0
   private identityUrl: string | null = null
   private identityRefresh: Promise<void> | null = null
+  private identityData: Record<string, unknown> | null = null
+  private playinfoUrl: string | null = null
+  private roomObservedAt = 0
   errors: string[] = []
   startedAt: string | null = null
 
@@ -147,6 +150,7 @@ export class LiveTap {
 
   /** Room changes discard the old room's cache and subscription before accepting new data. */
   private observeRoom(room: string | null): void {
+    this.roomObservedAt = Date.now()
     if (room === this.currentRoomId) return
     this.roomId = room
     this.playinfoRoomId = null
@@ -168,6 +172,7 @@ export class LiveTap {
     this.pageGeneration++
     this.loggedIn = false
     this.facts = null
+    this.identityData = null
     this.observeRoom(null)
   }
 
@@ -261,6 +266,7 @@ export class LiveTap {
           if (generation !== this.pageGeneration || page.isClosed()) return
           const data = body?.data ?? {}
           const nextAccount = data.user_id ? String(data.user_id) : null
+          this.identityData = data
           if (this.facts && (this.facts.userId !== nextAccount || this.facts.buyinAccountId !== (data.buyin_account_id ? String(data.buyin_account_id) : null))) this.observeRoom(null)
           this.facts = {
             userId: data.user_id ? String(data.user_id) : null,
@@ -273,6 +279,7 @@ export class LiveTap {
           const authenticatedPage = await this.detectLogin()
           if (generation === this.pageGeneration && !page.isClosed()) this.loggedIn = !!nextAccount && authenticatedPage
         } else if (/livepc\/playinfo/.test(url)) {
+          this.playinfoUrl = url
           const body = await response.json()
           if (generation !== this.pageGeneration || page.isClosed()) return
           const data = body?.data ?? {}
@@ -304,12 +311,35 @@ export class LiveTap {
           || this.facts.buyinAccountId !== String(data.buyin_account_id))) this.observeRoom(null)
         this.facts = { userId: String(data.user_id), originUid: data.origin_uid ? String(data.origin_uid) : null,
           buyinAccountId: String(data.buyin_account_id), drAuth: data.dr_auth ?? null, observedAt: new Date().toISOString() }
+        this.identityData = data
         this.loggedIn = loggedIn
       } catch {
-        if (generation === this.pageGeneration) { this.loggedIn = false; this.facts = null }
+        if (generation === this.pageGeneration) { this.loggedIn = false; this.facts = null; this.identityData = null }
       }
     })().finally(() => { this.identityRefresh = null })
     return this.identityRefresh
+  }
+
+  /** Same owned, headless page used by the collector. No browser state is exported. */
+  replyContext() {
+    if (this.options.headless === false || !this.consolePage || this.consolePage.isClosed()) throw new Error('buyin_background_page_unavailable')
+    const url = new URL(this.consolePage.url())
+    if (url.origin !== 'https://buyin.jinritemai.com' || url.pathname !== '/dashboard/live/control') throw new Error('buyin_page_changed')
+    return { page: this.consolePage, generation: this.pageGeneration, facts: this.facts,
+      identityData: this.identityData, loggedIn: this.loggedIn, roomId: this.currentRoomId, roomObservedAt: this.roomObservedAt }
+  }
+
+  /** Reuse only a room endpoint already observed on this platform page; no invented URL. */
+  async refreshReplyEvidence(): Promise<void> {
+    const pinned = this.replyContext()
+    await this.refreshIdentity()
+    if (!this.loggedIn || !this.facts) throw new Error('buyin_login_unavailable')
+    if (!this.playinfoUrl) throw new Error('buyin_room_endpoint_unobserved')
+    const response = await pinned.page.request.get(this.playinfoUrl, { timeout: 3000, maxRedirects: 0 })
+    const body = await response.json()
+    if (this.pageGeneration !== pinned.generation || pinned.page.isClosed()) throw new Error('buyin_context_changed')
+    if (!response.ok()) { this.observeRoom(null); throw new Error('buyin_room_unavailable') }
+    this.observeRoom(isValidRoomId(String(body?.data?.room_id ?? '')) ? String(body.data.room_id) : null)
   }
 
   /** 拿到本场 room_id 后再挂罗盘大屏（它才是弹幕/互动的主通道）。 */
