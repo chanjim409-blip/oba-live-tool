@@ -9,6 +9,34 @@ import { LiveTap } from './liveTap'
 import { startBridgeServer } from './bridgeServer'
 import type { RoomBrowserDriver } from './roomBrowserDriver'
 
+test('manual inspection reports a fixed failure stage without leaking raw error or clearing stop', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'buyin-inspection-failure-'))
+  const token = 'synthetic-token-'.repeat(4)
+  const db = openHostBridgeDb(join(dir, 'host-identity.sqlite'))
+  new PlatformRestrictionStore(db.db).record('host_platform_restricted'); db.close()
+  let opens = 0
+  const host = await startBridgeServer({ port: 0, token, dataDir: dir, storageStatePath: null,
+    replyBrowser: { profileDir: 'synthetic', executablePath: 'synthetic', capturePaths: [], anchorName: 'synthetic',
+      expectedOwnerId: 'synthetic', expectedExecutorId: 'synthetic' },
+    inspectionFactory: () => ({ status: 'failed' as const, failureStage: 'browser_launch' as const,
+      open: async () => { opens++; throw new Error('synthetic-secret-not-for-clients') }, close: async () => {} }), log: () => {} })
+  const url = `http://127.0.0.1:${host.port}`
+  const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' }
+  try {
+    const response = await fetch(`${url}/reply/manual-inspection`, { method: 'POST', headers, body: JSON.stringify({ confirmed: true }) })
+    assert.equal(response.status, 409)
+    assert.deepEqual(await response.json(), { error_code: 'bridge_inspection_open_failed', failure_stage: 'browser_launch', restriction_code: 'host_platform_restricted' })
+    const status = await fetch(`${url}/reply/manual-inspection`, { headers })
+    const body = await status.json() as Record<string, unknown>
+    assert.equal(body.failure_stage, 'browser_launch')
+    assert.doesNotMatch(JSON.stringify(body), /synthetic-secret/)
+    const retry = await fetch(`${url}/reply/manual-inspection`, { method: 'POST', headers, body: JSON.stringify({ confirmed: true }) })
+    assert.equal(retry.status, 409)
+    assert.equal(opens, 1)
+    assert.equal((await (await fetch(`${url}/collector/restriction`, { headers })).json() as { restriction_code: string }).restriction_code, 'host_platform_restricted')
+  } finally { await host.stop(); rmSync(dir, { recursive: true, force: true }) }
+})
+
 test('manual inspection is authenticated, explicitly requested and preserves stop across restart', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'buyin-inspection-'))
   const token = 'synthetic-token-'.repeat(4)

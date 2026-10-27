@@ -70,3 +70,25 @@ test('manual inspection closes its own browser if stop changes while opening', a
     assert.equal(window.status, 'failed')
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
+
+test('manual inspection failure stage is fixed and never leaks browser exception details', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'manual-inspection-'))
+  const scenarios = ['browser_launch', 'official_page_navigation'] as const
+  try {
+    for (const scenario of scenarios) {
+      const context = { newPage: async () => ({ goto: async () => { throw new Error('synthetic secret=never-show') }, bringToFront: async () => {} }),
+        on: () => {}, close: async () => {} }
+      const window = new ManualInspectionWindow(config(await realpath(dir)), {
+        checkProfile: async () => {},
+        launch: (async () => { if (scenario === 'browser_launch') throw new Error('synthetic secret=never-show'); return context }) as never,
+      })
+      try {
+        await assert.rejects(window.open(() => {}), /inspection_open_failed/)
+        assert.equal(window.status, 'failed')
+        assert.equal(window.failureStage, scenario)
+        assert.doesNotMatch(JSON.stringify({ stage: window.failureStage }), /secret|never-show/)
+        await assert.rejects(window.open(() => {}), /inspection_already_started/)
+      } finally { await window.close() }
+    }
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})

@@ -60,7 +60,7 @@ export interface BridgeServerConfig {
   restrictionStoreFactory?: (db: ReturnType<typeof openHostBridgeDb>['db']) => PlatformRestrictionStore
   replyDriverFactory?: (config: RoomBrowserConfig) => RoomBrowserDriver
   /** Offline tests only. Production uses the strictly scoped inspection window. */
-  inspectionFactory?: (config: RoomBrowserConfig) => Pick<ManualInspectionWindow, 'open' | 'close' | 'status'>
+  inspectionFactory?: (config: RoomBrowserConfig) => Pick<ManualInspectionWindow, 'open' | 'close' | 'status'> & Partial<Pick<ManualInspectionWindow, 'failureStage'>>
 }
 
 export interface RunningBridgeServer {
@@ -131,7 +131,7 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
   }
   let replyDriver: RoomBrowserDriver | null = null
   let tap: LiveTap | null = null
-  let inspection: Pick<ManualInspectionWindow, 'open' | 'close' | 'status'> | null = null
+  let inspection: (Pick<ManualInspectionWindow, 'open' | 'close' | 'status'> & Partial<Pick<ManualInspectionWindow, 'failureStage'>>) | null = null
   let volatileStop: 'host_restriction_store_unavailable' | null = hadStorageFault ? 'host_restriction_store_unavailable' : null
   const stopOwnedBrowsers = () => {
     const owned = replyDriver
@@ -336,12 +336,12 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
           await inspection.close().catch(() => undefined)
           const allowed = ['inspection_profile_busy_or_unavailable', 'inspection_profile_alias_unsupported', 'inspection_configuration_invalid']
           const detail = error instanceof Error && allowed.includes(error.message) ? `bridge_${error.message}` : 'bridge_inspection_open_failed'
-          json(409, { error_code: detail, restriction_code: currentRestriction() })
+          json(409, { error_code: detail, ...(inspection.failureStage ? { failure_stage: inspection.failureStage } : {}), restriction_code: currentRestriction() })
         }
         return
       }
       if (url.pathname === '/reply/manual-inspection' && request.method === 'GET') {
-        json(200, { mode: 'human_inspection', state: inspection?.status ?? 'idle', restriction_code: currentRestriction() })
+        json(200, { mode: 'human_inspection', state: inspection?.status ?? 'idle', ...(inspection?.failureStage ? { failure_stage: inspection.failureStage } : {}), restriction_code: currentRestriction() })
         return
       }
 
