@@ -1,5 +1,7 @@
 # live-assistant宿主集成状态
 
+> **2026-10-27 接力提醒**：真实百应弹幕与货盘只读链路已有现场观察；达人身份角色含义、后台发言、原生 @、商品动作及平台回执仍未实场验收。旧助理待核查标记已迁移为持久停刷，原因与影响范围尚不明确；人工查看窗口曾打开失败。现网版本和场次状态必须现场只读核对，不能依据下方历史记录自动恢复或绕过限制。详见 [人工查看失败诊断](dev-log/2026-10-27-manual-inspection-diagnostics.md) 和 [停刷与身份代次](dev-log/2026-10-27-persistent-stop.md)。
+
 ## 当前入口（2026-10-26复审）
 
 本机原维护分支 `harness/live-assistant-bridge`；用户fork `chanjim409-blip/oba-live-tool` 的干净发布分支 `codex/live-assistant-bridge`。不推原作者origin，不上传包含旧私有标识的本机历史。详见 [复审记录](dev-log/2026-10-26-audit-fork.md)。
