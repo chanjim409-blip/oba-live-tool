@@ -8,6 +8,13 @@ import { startBridgeServer } from './bridgeServer'
 import { ScopeGuard, parseScope } from './scopeGuard'
 import { TapIdentitySource } from './tapIdentitySource'
 
+test('unverified creator role mappings cannot enable real buyin execution', async () => {
+  await assert.rejects(startBridgeServer({ port: 0, token: 'synthetic-test-token-'.repeat(3),
+    dataDir: 'synthetic-unused', storageStatePath: null, buyinReplyExecutionEnabled: true,
+    buyinReply: { expectedOwnerId: 'owner', expectedExecutorId: 'executor', inputSelector: 'textarea', submitSelector: 'button',
+      creatorRoleEvidence: { path: ['user_id'], value: 'owner' } } }), /buyin_creator_role_proof_unverified/)
+})
+
 const scope = { platform: 'douyin', account_id: 'synthetic-owner', room_id: '10000000000001', session_id: 'synthetic-session' }
 const query = new URLSearchParams(scope).toString()
 class OfflineTap extends LiveTap {
@@ -22,6 +29,27 @@ class OfflineTap extends LiveTap {
   push(event: TapCommentEvent) { (this as unknown as { emit(e: TapCommentEvent): void }).emit(event) }
   switchRoom(room: string | null) { (this as unknown as { observeRoom(r: string | null): void }).observeRoom(room) }
 }
+
+test('health remains readable and collector refresh remains stopped after a platform restriction', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-stop-'))
+  const token = 'synthetic-test-token-'.repeat(3)
+  let tap!: OfflineTap
+  const bridge = await startBridgeServer({ port: 0, token, dataDir: dir, storageStatePath: 'synthetic',
+    log: () => {}, tapFactory: options => (tap = new OfflineTap(options)) })
+  const request = (path: string, init: RequestInit = {}) => fetch(`http://127.0.0.1:${bridge.port}${path}`,
+    { ...init, headers: { authorization: `Bearer ${token}`, ...init.headers } })
+  try {
+    tap.markPlatformRestriction('host_rate_limited')
+    for (let i = 0; i < 2; i++) {
+      const health = await request('/health')
+      assert.equal(health.status, 200)
+      assert.equal((await health.json() as any).restriction_code, 'host_rate_limited')
+      const refresh = await request('/collector/refresh', { method: 'POST' })
+      assert.equal(refresh.status, 409)
+      assert.equal((await refresh.json() as any).error_code, 'host_rate_limited')
+    }
+  } finally { await bridge.stop(); rmSync(dir, { recursive: true, force: true }) }
+})
 
 test('scope registration cannot be stolen, misreleased, or accepted without observed identity', () => {
   const observed = { loggedIn: true, accountId: scope.account_id as string | null, roomId: scope.room_id as string | null }

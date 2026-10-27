@@ -20,7 +20,9 @@
  */
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { chromium } from 'playwright'
+import { isCreatorControlPage } from './creator-login-policy.mjs'
 
 const systemPrivateRoot = resolve(process.env.LIVE_ASSISTANT_PRIVATE_DIR || (process.platform === 'win32' ? 'D:/live-assistant/private' : join(process.env.HOME || '.', 'live-assistant-private')))
 const PRIVATE_ROOT = resolve(
@@ -51,6 +53,14 @@ const SITES = {
     inLive: '[class^="goodsPanel"]',
     loginPath: /\/mpa\/account\/login|douyinec\.com/,
   },
+  'buyin-creator': {
+    label: '百应·达人本人（只读登录准备）',
+    login: 'https://buyin.jinritemai.com/dashboard/live/control',
+    home: 'https://buyin.jinritemai.com/dashboard/live/control',
+    accountName: 'span.btn-item-role-exchange-name__title',
+    inLive: '[class^="goodsPanel"], #input-comment-block-id, [class*="input-comment-block-id"]',
+    loginPath: /\/mpa\/account\/login|\/login\b|douyinec\.com/,
+  },
 }
 
 function arg(name, fallback = null) {
@@ -59,7 +69,7 @@ function arg(name, fallback = null) {
 }
 
 const only = arg('only', null)
-const targets = only ? [String(only)] : Object.keys(SITES)
+const targets = only ? [String(only)] : ['douyin', 'buyin']
 for (const key of targets) if (!SITES[key]) throw new Error(`不认识的站点：${key}`)
 
 const profileDir = arg('profile', join(PRIVATE_ROOT, 'chrome-profile'))
@@ -89,8 +99,23 @@ context.on('close', () => {
   log('浏览器已关闭，进程退出。')
 })
 
+// Existing login data and reports belong to prior runs: create, never overwrite them.
+function writeExclusive(name, contents) {
+  const dot = name.lastIndexOf('.')
+  const candidate = join(PRIVATE_ROOT, name)
+  try { writeFileSync(candidate, contents, { encoding: 'utf8', flag: 'wx' }); return candidate }
+  catch (error) { if (error?.code !== 'EEXIST') throw error }
+  const unique = join(PRIVATE_ROOT, `${name.slice(0, dot)}-${randomUUID()}${name.slice(dot)}`)
+  writeFileSync(unique, contents, { encoding: 'utf8', flag: 'wx' })
+  return unique
+}
 const report = { startedAt: new Date().toISOString(), profileDir, sites: {} }
-const writeReport = () => writeFileSync(join(PRIVATE_ROOT, 'login-report.json'), JSON.stringify(report, null, 2), { encoding: 'utf8' })
+let reportPath = null
+const writeReport = () => {
+  const contents = JSON.stringify(report, null, 2)
+  if (!reportPath) reportPath = writeExclusive('login-report.json', contents)
+  else writeFileSync(reportPath, contents, { encoding: 'utf8' })
+}
 
 const pages = new Map()
 for (const key of targets) {
@@ -98,15 +123,14 @@ for (const key of targets) {
   const page = await context.newPage()
   pages.set(key, page)
   await page.goto(site.login, { waitUntil: 'domcontentloaded' }).catch((error) => log(`${site.label} 打开失败：${error.message}`))
-  report.sites[key] = { label: site.label, url: page.url(), loggedIn: false }
+  report.sites[key] = { label: site.label, loggedIn: false }
   log(`已打开「${site.label}」，请在窗口里扫码登录`)
 }
 writeReport()
 
 /** 单个站点的侦察：只读，不点业务按钮。 */
-async function inspect(key) {
+async function inspectPage(key, page) {
   const site = SITES[key]
-  const page = pages.get(key)
   if (!page || page.isClosed()) return { closed: true }
   const href = page.url()
   const inApp = !site.loginPath.test(href)
@@ -117,11 +141,32 @@ async function inspect(key) {
         accountName: nameNode ? (nameNode.textContent ?? '').trim() : null,
         hasNameNode: Boolean(nameNode),
         hasLivePanel: Boolean(document.querySelector(inLive)),
+        hasChallenge: [...document.querySelectorAll('iframe[src*="captcha"],iframe[src*="verifycenter"],[id*="captcha"]')].some(el => el.getClientRects().length > 0),
         md5Canvas: Boolean(document.querySelector('canvas, img[class*="qr"], [class*="qrcode"], [class*="qrCode"]')),
       }
     }, site)
-    .catch(() => ({ accountName: null, hasNameNode: false, hasLivePanel: false, md5Canvas: false }))
-  return { href, inApp, ...markers }
+    .catch(() => ({ accountName: null, hasNameNode: false, hasLivePanel: false, hasChallenge: true, md5Canvas: false }))
+  // Never place the unmasked nickname into the report.
+  const { accountName, ...safeMarkers } = markers
+  return { href, inApp, ...safeMarkers, accountDisplayName: mask(accountName) }
+}
+
+async function inspect(key) {
+  const original = pages.get(key)
+  if (!original) return { state: { closed: true }, page: null }
+  // An SSO login can open a new tab in the same context; examine only pages in that context.
+  const candidates = key === 'buyin-creator' ? [original, ...context.pages().filter(page => page !== original)] : [original]
+  let fallback = { closed: true }
+  for (const page of candidates) {
+    const state = await inspectPage(key, page).catch(() => ({ closed: true }))
+    if (page === original) fallback = state
+    if (key === 'buyin-creator' && isCreatorControlPage(state)) return { state, page }
+  }
+  return { state: fallback, page: original }
+}
+
+const safeUrl = href => {
+  try { const url = new URL(href); return `${url.origin}${url.pathname}` } catch { return null }
 }
 
 let tick = 0
@@ -131,35 +176,36 @@ while (!closing) {
   tick += 1
   for (const key of targets) {
     const site = SITES[key]
-    const state = await inspect(key).catch(() => ({ closed: true }))
-    report.sites[key] = { ...report.sites[key], ...state, checkedAt: new Date().toISOString() }
+    const { state, page } = await inspect(key).catch(() => ({ state: { closed: true }, page: null }))
+    report.sites[key] = { ...report.sites[key], ...state, href: safeUrl(state.href), checkedAt: new Date().toISOString() }
     if (state.closed) continue
     // 判定：不在登录路径 + 出现账号名节点。商品面板用于判断"是否已到中控台"。
-    const loggedIn = state.inApp && state.hasNameNode
+    const loggedIn = key === 'buyin-creator' ? isCreatorControlPage(state) : state.inApp && state.hasNameNode
     if (!loggedIn) {
       if (tick % 6 === 1) log(`${site.label}：等待扫码（页面 ${state.inApp ? '已离开登录页' : '仍在登录页'}）`)
       continue
     }
-    if (state.hasLivePanel && !state.href.startsWith(site.home)) {
-      await pages.get(key).goto(site.home, { waitUntil: 'domcontentloaded' }).catch(() => {})
+    if (key !== 'buyin-creator' && state.hasLivePanel && !state.href.startsWith(site.home)) {
+      await page.goto(site.home, { waitUntil: 'domcontentloaded' }).catch(() => {})
       await new Promise((resolve) => setTimeout(resolve, 4000))
     }
-    const finalState = await inspect(key)
-    const storageStateFile = join(PRIVATE_ROOT, `${key}.storage.json`)
-    writeFileSync(storageStateFile, JSON.stringify(await context.storageState()), { encoding: 'utf8' })
+    const finalState = await inspectPage(key, page)
+    if (key === 'buyin-creator' && !isCreatorControlPage(finalState)) continue
+    if (key !== 'buyin-creator' && (!finalState.inApp || !finalState.hasNameNode || finalState.hasChallenge)) continue
+    const storageStateFile = writeExclusive(`${key}.storage.json`, JSON.stringify(await context.storageState()))
     report.sites[key] = {
       label: site.label,
       loggedIn: true,
       loggedInAt: new Date().toISOString(),
       inLiveControlPage: finalState.hasLivePanel,
-      href: finalState.href,
-      accountDisplayName: mask(finalState.accountName),
+      href: safeUrl(finalState.href),
+      accountDisplayName: finalState.accountDisplayName,
       storageStateFile,
     }
     writeReport()
     log(`${site.label} 登录成功：${finalState.hasLivePanel ? '已进入中控台' : '账号名已出现，但商品面板还没渲染'}`)
-    log(`  页面：${finalState.href}`)
-    log(`  账号名：${mask(finalState.accountName)}（掩码，不落明文）`)
+    log(`  页面：${safeUrl(finalState.href)}`)
+    log(`  账号名：${finalState.accountDisplayName}（掩码，不落明文）`)
     log(`  登录态：${storageStateFile}`)
     pages.delete(key)
   }

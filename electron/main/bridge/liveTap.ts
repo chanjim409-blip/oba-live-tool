@@ -16,6 +16,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { chromium, type Browser, type BrowserContext, type Page, type Request } from 'playwright'
+import { HostIdentityError } from './vendor/hostIdentity'
 
 export interface TapCommentEvent {
   roomId: string
@@ -46,6 +47,8 @@ export interface TapOptions {
   compassScreen?: string
   /** 事件环形缓冲大小，用于 SSE 断线续传 */
   bufferSize?: number
+  /** Identity preparation must not start a second live-comment/analytics collector. */
+  identityOnly?: boolean
   log?: (message: string) => void
 }
 
@@ -93,6 +96,8 @@ export class LiveTap {
   private identityData: Record<string, unknown> | null = null
   private playinfoUrl: string | null = null
   private roomObservedAt = 0
+  /** Latched until the operator explicitly rebuilds the host after investigating the restriction. */
+  private platformStop: string | null = null
   errors: string[] = []
   startedAt: string | null = null
 
@@ -102,6 +107,27 @@ export class LiveTap {
 
   private log(message: string) {
     this.options.log?.(message)
+  }
+
+  get restrictionCode(): string | null { return this.platformStop }
+
+  markPlatformRestriction(code: 'host_login_expired' | 'host_permission_denied' | 'host_rate_limited' | 'host_platform_restricted'): void {
+    if (this.platformStop) return
+    this.platformStop = code
+    const page = this.consolePage
+    this.invalidatePage()
+    // The page is an owned collector page; closing it stops its own recurring polling too.
+    if (page && typeof page.close === 'function') void page.close().catch(() => {})
+  }
+
+  private requirePlatformAvailable(): void {
+    if (this.platformStop) throw new HostIdentityError(this.platformStop)
+  }
+
+  private checkPlatformStatus(status: number): void {
+    const code = status === 401 ? 'host_login_expired' : status === 403 ? 'host_permission_denied'
+      : status === 429 ? 'host_rate_limited' : null
+    if (code) { this.markPlatformRestriction(code); this.requirePlatformAvailable() }
   }
 
   /** 当前是否"开播中"：唯一判据是拿到本场 room_id（文本匹配和历史 last_room_id 都不可靠）。 */
@@ -191,6 +217,7 @@ export class LiveTap {
       .goto(this.options.consoleUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 })
       .catch((error) => this.errors.push(`console_nav_failed:${error.message}`))
     this.loggedIn = await this.detectLogin()
+    this.requirePlatformAvailable()
     this.log(`中控台已打开，登录态=${this.loggedIn ? '已登录' : '未确认'}`)
   }
 
@@ -215,7 +242,7 @@ export class LiveTap {
     page.on('framenavigated', frame => {
       if (frame === page.mainFrame()) {
         this.invalidatePage()
-        if (this.identityUrl) void this.refreshIdentity()
+        if (this.identityUrl && !this.platformStop) void this.refreshIdentity().catch(() => {})
       }
     })
     page.on('close', () => this.invalidatePage())
@@ -225,6 +252,11 @@ export class LiveTap {
       const url = response.url()
       const endpoint = new URL(url)
       if (endpoint.protocol !== 'https:' || endpoint.hostname !== 'buyin.jinritemai.com') return
+      if (this.platformStop) return
+      if (endpoint.pathname.endsWith('/index/getUser') || /livepc\/playinfo/.test(endpoint.pathname)) {
+        const status = typeof response.status === 'function' ? response.status() : 200
+        try { this.checkPlatformStatus(status) } catch { return }
+      }
       if (!/json/i.test(response.headers()['content-type'] ?? '')) return
       try {
         if (/promotions_v2/.test(url)) {
@@ -294,6 +326,7 @@ export class LiveTap {
 
   /** Re-read the already observed platform identity endpoint after SPA navigation; never reuse old facts. */
   async refreshIdentity(): Promise<void> {
+    this.requirePlatformAvailable()
     if (this.identityRefresh) return this.identityRefresh
     const page = this.consolePage
     const url = this.identityUrl
@@ -302,6 +335,8 @@ export class LiveTap {
     this.identityRefresh = (async () => {
       try {
         const response = await page.request.get(url, { timeout: 5000, maxRedirects: 0 })
+        this.requirePlatformAvailable()
+        this.checkPlatformStatus(response.status())
         const body = await response.json()
         const data = body?.data
         if (!response.ok() || !data?.user_id || !data.buyin_account_id) throw new Error('identity_unavailable')
@@ -315,13 +350,26 @@ export class LiveTap {
         this.loggedIn = loggedIn
       } catch {
         if (generation === this.pageGeneration) { this.loggedIn = false; this.facts = null; this.identityData = null }
+        this.requirePlatformAvailable()
       }
     })().finally(() => { this.identityRefresh = null })
     return this.identityRefresh
   }
 
+  /** Only return location and challenge booleans; never page text, identifiers or credentials. */
+  async identityProbeSummary() {
+    const page = this.consolePage
+    if (!page || page.isClosed()) return { available: false, restricted: false, host: null, path: null }
+    const current = new URL(page.url())
+    const restricted = await page.locator('iframe[src*="captcha"]:visible,iframe[src*="verifycenter"]:visible,[id*="captcha"]:visible').count() > 0
+    if (restricted) this.markPlatformRestriction('host_platform_restricted')
+    return { available: true, restricted, host: current.hostname, path: current.pathname,
+      identityEndpointObserved: !!this.identityUrl, loggedIn: this.loggedIn }
+  }
+
   /** Same owned, headless page used by the collector. No browser state is exported. */
   replyContext() {
+    this.requirePlatformAvailable()
     if (this.options.headless === false || !this.consolePage || this.consolePage.isClosed()) throw new Error('buyin_background_page_unavailable')
     const url = new URL(this.consolePage.url())
     if (url.origin !== 'https://buyin.jinritemai.com' || url.pathname !== '/dashboard/live/control') throw new Error('buyin_page_changed')
@@ -331,11 +379,14 @@ export class LiveTap {
 
   /** Reuse only a room endpoint already observed on this platform page; no invented URL. */
   async refreshReplyEvidence(): Promise<void> {
+    this.requirePlatformAvailable()
     const pinned = this.replyContext()
     await this.refreshIdentity()
     if (!this.loggedIn || !this.facts) throw new Error('buyin_login_unavailable')
     if (!this.playinfoUrl) throw new Error('buyin_room_endpoint_unobserved')
     const response = await pinned.page.request.get(this.playinfoUrl, { timeout: 3000, maxRedirects: 0 })
+    this.requirePlatformAvailable()
+    this.checkPlatformStatus(response.status())
     const body = await response.json()
     if (this.pageGeneration !== pinned.generation || pinned.page.isClosed()) throw new Error('buyin_context_changed')
     if (!response.ok()) { this.observeRoom(null); throw new Error('buyin_room_unavailable') }
@@ -344,6 +395,7 @@ export class LiveTap {
 
   /** 拿到本场 room_id 后再挂罗盘大屏（它才是弹幕/互动的主通道）。 */
   private async ensureCompass(): Promise<void> {
+    if (this.options.identityOnly) return
     if (this.compassAttached || this.compassPage || !this.live || !this.context) return
     const roomId = this.currentRoomId
     if (!roomId) return
@@ -413,6 +465,7 @@ export class LiveTap {
 
   /** Explicit read-only recovery of this collector page; does not change account or permissions. */
   async refreshConsole(): Promise<void> {
+    this.requirePlatformAvailable()
     const page = this.consolePage
     if (!page || page.isClosed()) throw new Error('bridge_collector_unavailable')
     this.invalidatePage()
@@ -424,6 +477,7 @@ export class LiveTap {
       if (generation === this.pageGeneration && !page.isClosed()) this.loggedIn = authenticated && !!this.facts?.userId
     } catch {
       this.invalidatePage()
+      this.requirePlatformAvailable()
       throw new Error('bridge_collector_refresh_failed')
     }
   }
@@ -431,6 +485,7 @@ export class LiveTap {
   status() {
     return {
       logged_in: this.loggedIn,
+      restriction_code: this.platformStop,
       identity_endpoint_observed: !!this.identityUrl,
       identity_observed_at: this.facts?.observedAt ?? null,
       console_closed: !this.consolePage || this.consolePage.isClosed(),

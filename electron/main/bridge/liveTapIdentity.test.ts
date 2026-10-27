@@ -14,7 +14,7 @@ function fixture() {
   page.evaluate = async () => true
   let next = { user_id: 'synthetic-owner', buyin_account_id: 'synthetic-executor' }
   let refreshes = 0
-  page.request = { get: async () => { refreshes++; return { ok: () => true, json: async () => ({ data: next }) } } }
+  page.request = { get: async () => { refreshes++; return { ok: () => true, status: () => 200, json: async () => ({ data: next }) } } }
   const internals = tap as any
   internals.consolePage = page
   internals.attachConsole(page)
@@ -62,4 +62,60 @@ test('executor switch clears room and failed refresh clears identity', async () 
   await f.tap.refreshIdentity()
   assert.equal(f.tap.loggedIn, false)
   assert.equal(f.tap.facts, null)
+})
+
+test('identity platform denial invalidates evidence and stops all further refresh or reload', async () => {
+  for (const [status, code] of [[401, 'host_login_expired'], [403, 'host_permission_denied'], [429, 'host_rate_limited']] as const) {
+    const f = fixture()
+    f.respond(f.request()); await tick()
+    let requests = 0, reloads = 0, closes = 0
+    f.page.close = async () => { closes++ }
+    f.page.reload = async () => { reloads++ }
+    f.page.request.get = async () => { requests++; return { ok: () => false, status: () => status, json: async () => ({}) } }
+    await assert.rejects(f.tap.refreshIdentity(), (e: any) => e.code === code)
+    assert.equal(f.tap.restrictionCode, code)
+    assert.equal(f.tap.loggedIn, false)
+    assert.equal(f.tap.facts, null)
+    await assert.rejects(f.tap.refreshIdentity(), (e: any) => e.code === code)
+    await assert.rejects(f.tap.refreshConsole(), (e: any) => e.code === code)
+    assert.equal(requests, 1)
+    assert.equal(reloads, 0)
+    assert.equal(closes, 1)
+  }
+})
+
+test('room response denial is latched before JSON parsing and cannot be refreshed again', async () => {
+  for (const [status, code] of [[401, 'host_login_expired'], [403, 'host_permission_denied'], [429, 'host_rate_limited']] as const) {
+    const f = fixture()
+    f.respond(f.request()); await tick()
+    f.page.url = () => 'https://buyin.jinritemai.com/dashboard/live/control'
+    const internals = f.tap as any
+    internals.playinfoUrl = 'https://buyin.jinritemai.com/livepc/playinfo'
+    let requests = 0, parsed = 0
+    f.page.request.get = async (url: string) => {
+      requests++
+      return url.includes('getUser')
+        ? { ok: () => true, status: () => 200, json: async () => ({ data: { user_id: 'synthetic-owner', buyin_account_id: 'synthetic-executor' } }) }
+        : { ok: () => false, status: () => status, json: async () => { parsed++; throw new Error('not json') } }
+    }
+    await assert.rejects(f.tap.refreshReplyEvidence(), (e: any) => e.code === code)
+    assert.equal(parsed, 0)
+    assert.equal(f.tap.restrictionCode, code)
+    await assert.rejects(f.tap.refreshReplyEvidence(), (e: any) => e.code === code)
+    assert.equal(requests, 2)
+  }
+})
+
+test('observed non-JSON restriction also latches and blocks automatic SPA refresh', async () => {
+  for (const [status, code] of [[401, 'host_login_expired'], [403, 'host_permission_denied'], [429, 'host_rate_limited']] as const) {
+    const f = fixture()
+    f.respond(f.request()); await tick()
+    f.page.emit('response', { request: () => f.request(), url: () => 'https://buyin.jinritemai.com/livepc/playinfo',
+      status: () => status, headers: () => ({ 'content-type': 'text/html' }) })
+    await tick()
+    assert.equal(f.tap.restrictionCode, code)
+    f.page.emit('framenavigated', f.frame)
+    await tick()
+    assert.equal(f.refreshes(), 0)
+  }
 })

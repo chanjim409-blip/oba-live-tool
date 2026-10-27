@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import type { LiveTap } from './liveTap'
 import type { BackgroundReplyDriver, ReplySnapshot } from './backgroundReplySource'
+import { HostIdentityError } from './vendor/hostIdentity'
 
 export interface BuyinReplyConfig {
   expectedOwnerId: string
@@ -31,12 +32,14 @@ export class BuyinReplyDriver implements BackgroundReplyDriver {
       throw new Error('buyin_reply_configuration_invalid')
   }
   async snapshot(signal?: AbortSignal): Promise<ReplySnapshot> {
-    if (signal?.aborted || this.blocked) throw new Error('buyin_reply_blocked')
+    if (signal?.aborted) throw new HostIdentityError('host_request_cancelled')
+    if (this.blocked) throw new HostIdentityError('host_platform_restricted')
     const pinned = this.tap.replyContext()
     if (!pinned.loggedIn) throw new Error('buyin_login_unavailable')
     if (await pinned.page.locator('iframe[src*="captcha"]:visible,iframe[src*="verifycenter"]:visible,[id*="captcha"]:visible').count()) {
       this.blocked = true
-      throw new Error('host_platform_restricted')
+      this.tap.markPlatformRestriction('host_platform_restricted')
+      throw new HostIdentityError('host_platform_restricted')
     }
     await this.tap.refreshReplyEvidence()
     const seen = this.tap.replyContext()
@@ -67,7 +70,7 @@ export class BuyinReplyDriver implements BackgroundReplyDriver {
     const finalContext = this.tap.replyContext()
     if (signal?.aborted || finalContext.page !== pinned.page || finalContext.generation !== pinned.generation
       || finalContext.roomId !== pinned.roomId) throw new Error('buyin_context_changed')
-    await pinned.page.evaluate(({ inputSelector, submitSelector, expectedText }) => {
+    try { await pinned.page.evaluate(({ inputSelector, submitSelector, expectedText }) => {
       if (location.origin !== 'https://buyin.jinritemai.com' || location.pathname !== '/dashboard/live/control') throw new Error('buyin_page_changed')
       if ([...document.querySelectorAll<HTMLElement>('iframe[src*="captcha"],iframe[src*="verifycenter"],[id*="captcha"]')].some(el => el.getClientRects().length > 0)) throw new Error('host_platform_restricted')
       const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(inputSelector)
@@ -76,7 +79,15 @@ export class BuyinReplyDriver implements BackgroundReplyDriver {
         || !inputs[0].getClientRects().length || !buttons[0].getClientRects().length
         || buttons[0].hasAttribute('disabled') || buttons[0].getAttribute('aria-disabled') === 'true') throw new Error('buyin_controls_changed')
       buttons[0].click()
-    }, { inputSelector: this.config.inputSelector, submitSelector: this.config.submitSelector, expectedText: text })
+    }, { inputSelector: this.config.inputSelector, submitSelector: this.config.submitSelector, expectedText: text }) }
+    catch (error) {
+      if (error instanceof Error && error.message.includes('host_platform_restricted')) {
+        this.blocked = true
+        this.tap.markPlatformRestriction('host_platform_restricted')
+        throw new HostIdentityError('host_platform_restricted')
+      }
+      throw error
+    }
     return { status: 'uncertain' as const, evidenceKind: 'click_only' as const, evidenceRef: null,
       observedAt: new Date().toISOString(), errorCode: 'host_delivery_unknown' }
   }

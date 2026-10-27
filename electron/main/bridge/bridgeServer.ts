@@ -19,7 +19,7 @@ import { timingSafeEqual } from 'node:crypto'
 import { join } from 'node:path'
 import { LiveTap, weakViewerId } from './liveTap'
 import { openHostBridgeDb } from './sqliteDb'
-import { HostIdentityBoundary } from './vendor/hostIdentity'
+import { HostIdentityBoundary, HostIdentityError } from './vendor/hostIdentity'
 import { createHostIdentityHandler } from './vendor/hostIdentityHttp'
 import type { HostIdentitySource } from './vendor/hostIdentity'
 import { TapIdentitySource, type RegisteredScope } from './tapIdentitySource'
@@ -73,8 +73,16 @@ const refusingIdentitySource: HostIdentitySource = {
   },
 }
 
+function requireVerifiedCreatorRole(enabled: boolean | undefined): void {
+  if (enabled === true) throw new Error('buyin_creator_role_proof_unverified')
+}
+
 export async function startBridgeServer(config: BridgeServerConfig): Promise<RunningBridgeServer> {
   if (config.token.length < MIN_TOKEN || /[\r\n]/.test(config.token)) throw new Error('bridge_token_invalid')
+  // Arbitrary getUser field/value configuration is not proof of creator identity.
+  // Keep real Buyin execution disabled until a platform role decoder has been independently verified.
+  requireVerifiedCreatorRole(config.buyinReplyExecutionEnabled)
+
   const log = config.log ?? ((message: string) => console.log(`[bridge] ${message}`))
   const expected = Buffer.from(`Bearer ${config.token}`)
 
@@ -196,7 +204,7 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
       }
 
       if (request.method === 'GET' && url.pathname === '/health') {
-        if (tap && !tap.loggedIn) await tap.refreshIdentity()
+        if (tap && !tap.loggedIn && !tap.restrictionCode) await tap.refreshIdentity()
         json(200, { ok: true, bridge: 'live-assistant-host', ...(tap ? tap.status() : { logged_in: false, live: false }),
           reply_transport: replyDriver ? (config.replyBrowser?.attachedEndpoint ? 'hidden_owned_browser' : 'headless_browser') : null,
           reply_execution_enabled: !!replySource && config.replyExecutionEnabled === true && !replyDriver?.manualVerificationActive,
@@ -386,7 +394,9 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
 
       json(404, { error_code: 'bridge_route_not_implemented', path: url.pathname })
     } catch (error) {
-      const code = error instanceof Error && /^bridge_[a-z_]+$/.test(error.message) ? error.message : 'bridge_failed'
+      const knownStopCodes = ['host_login_expired', 'host_permission_denied', 'host_rate_limited', 'host_platform_restricted']
+      const code = error instanceof HostIdentityError && knownStopCodes.includes(error.code) ? error.code
+        : error instanceof Error && /^bridge_[a-z_]+$/.test(error.message) ? error.message : 'bridge_failed'
       log(`请求失败：${code}`)
       if (!response.headersSent) json(code === 'bridge_body_too_large' ? 413 : code === 'bridge_json_invalid' || code === 'bridge_scope_invalid' ? 400 : code === 'bridge_failed' ? 500 : 409, { error_code: code })
       else response.end()
