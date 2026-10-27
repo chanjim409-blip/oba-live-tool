@@ -190,6 +190,13 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
         return
       }
 
+      if (request.method === 'POST' && url.pathname === '/collector/refresh') {
+        if (!tap) { json(409, { error_code: 'bridge_collector_unavailable' }); return }
+        await tap.refreshConsole()
+        json(200, tap.status())
+        return
+      }
+
       if (request.method === 'GET' && url.pathname === '/reply/preflight') {
         json(200, replyDriver ? await replyDriver.inspect() : { transport: null, ready: false, reason: 'reply_browser_unavailable' })
         return

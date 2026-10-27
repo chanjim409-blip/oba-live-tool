@@ -46,6 +46,12 @@ test('real HTTP routes reject wrong scope, invalid bodies, foreign origin and mi
   const request = (path: string, init: RequestInit = {}) => fetch(`http://127.0.0.1:${bridge.port}${path}`, { ...init, headers: { authorization: `Bearer ${token}`, ...init.headers } })
   let stream: ReadableStreamDefaultReader<Uint8Array> | undefined
   try {
+    let refreshes = 0
+    tap.refreshConsole = async () => { refreshes++ }
+    assert.equal((await fetch(`http://127.0.0.1:${bridge.port}/collector/refresh`, { method: 'POST' })).status, 401)
+    assert.equal(refreshes, 0)
+    assert.equal((await request('/collector/refresh', { method: 'POST' })).status, 200)
+    assert.equal(refreshes, 1)
     assert.equal((await request('/health', { headers: { origin: 'https://foreign.invalid' } })).status, 403)
     assert.equal((await request('/sessions')).status, 405)
     assert.equal((await request('/sessions', { method: 'POST', body: '{invalid' })).status, 400)

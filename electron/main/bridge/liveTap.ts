@@ -381,9 +381,29 @@ export class LiveTap {
     }
   }
 
+  /** Explicit read-only recovery of this collector page; does not change account or permissions. */
+  async refreshConsole(): Promise<void> {
+    const page = this.consolePage
+    if (!page || page.isClosed()) throw new Error('bridge_collector_unavailable')
+    this.invalidatePage()
+    try {
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 })
+      await this.refreshIdentity()
+      const generation = this.pageGeneration
+      const authenticated = await this.detectLogin()
+      if (generation === this.pageGeneration && !page.isClosed()) this.loggedIn = authenticated && !!this.facts?.userId
+    } catch {
+      this.invalidatePage()
+      throw new Error('bridge_collector_refresh_failed')
+    }
+  }
+
   status() {
     return {
       logged_in: this.loggedIn,
+      identity_endpoint_observed: !!this.identityUrl,
+      identity_observed_at: this.facts?.observedAt ?? null,
+      console_closed: !this.consolePage || this.consolePage.isClosed(),
       live: this.live,
       room_id: this.currentRoomId,
       compass_attached: this.compassAttached,
