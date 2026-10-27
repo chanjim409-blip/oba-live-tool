@@ -186,7 +186,7 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
         if (tap && !tap.loggedIn) await tap.refreshIdentity()
         json(200, { ok: true, bridge: 'live-assistant-host', ...(tap ? tap.status() : { logged_in: false, live: false }),
           reply_transport: replyDriver ? (config.replyBrowser?.attachedEndpoint ? 'hidden_owned_browser' : 'headless_browser') : null,
-          reply_execution_enabled: !!replySource && config.replyExecutionEnabled === true })
+          reply_execution_enabled: !!replySource && config.replyExecutionEnabled === true && !replyDriver?.manualVerificationActive })
         return
       }
 
@@ -199,6 +199,20 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
 
       if (request.method === 'GET' && url.pathname === '/reply/preflight') {
         json(200, replyDriver ? await replyDriver.inspect() : { transport: null, ready: false, reason: 'reply_browser_unavailable' })
+        return
+      }
+      if (request.method === 'POST' && ['/reply/manual-verification/open', '/reply/manual-verification/complete'].includes(url.pathname)) {
+        if (!replyDriver || !replySource) { json(409, { error_code: 'bridge_reply_unavailable' }); return }
+        const body = await readJson(request)
+        if (Object.keys(body).length !== 1 || body.confirmed !== true) { json(400, { error_code: 'bridge_manual_confirmation_required' }); return }
+        if (url.pathname.endsWith('/open')) {
+          replySource.beginManualVerification()
+          await replyDriver.beginManualVerification()
+        } else {
+          await replyDriver.completeManualVerification()
+          replySource.completeManualVerification()
+        }
+        json(200, await replyDriver.inspect())
         return
       }
       if (request.method === 'POST' && url.pathname === '/reply/refresh') {

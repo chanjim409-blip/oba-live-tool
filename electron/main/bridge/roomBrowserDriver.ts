@@ -32,7 +32,75 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
   private roomDiagnostic: Record<string, unknown> | null = null
   private attachedBrowser: Browser | null = null
   private ownedPid: number | null = null
+  private manualState: 'none' | 'opening' | 'manual' | 'checking' | 'blocked' = 'none'
+  private manualWindowVisible = false
+  get manualVerificationActive(): boolean { return this.manualState !== 'none' }
   constructor(private readonly config: RoomBrowserConfig) {}
+
+  private async launchOwnedContext(headless: boolean): Promise<void> {
+    this.context = await chromium.launchPersistentContext(this.config.profileDir, {
+      headless, executablePath: this.config.executablePath,
+    })
+    this.selfPage = await this.context.newPage()
+    this.roomPage = await this.context.newPage()
+    this.listen(this.selfPage, 'self')
+    this.listen(this.roomPage, 'room')
+  }
+
+  private clearObservations(): void {
+    this.generations.self++
+    this.generations.room++
+    this.self = null
+    this.room = null
+  }
+
+  /** Explicit human handoff: gracefully close only our context, then open the same profile. */
+  async beginManualVerification(): Promise<void> {
+    if (this.attachedBrowser) throw new Error('bridge_manual_attached_browser_unsupported')
+    if (this.manualState === 'manual') return
+    if (this.manualState === 'opening' || this.manualState === 'checking') throw new Error('bridge_manual_busy')
+    this.manualState = 'opening'
+    this.clearObservations()
+    try {
+      await this.pending?.catch(() => undefined)
+      await this.context?.close()
+      this.context = null
+      this.manualWindowVisible = false
+      this.clearObservations()
+      await this.launchOwnedContext(false)
+      this.manualWindowVisible = true
+      this.manualState = 'manual'
+      // Navigation only. The person handles verification; no automatic CAPTCHA interaction.
+      await this.selfPage!.goto('https://www.douyin.com/user/self?from_nav=1', { waitUntil: 'domcontentloaded', timeout: 12_000 })
+      await this.roomPage!.goto(this.url, { waitUntil: 'domcontentloaded', timeout: 12_000 })
+      await this.roomPage!.bringToFront()
+    } catch (error) {
+      // A slow page may still be usable by the person; do not reopen/refresh it automatically.
+      this.manualState = this.manualWindowVisible ? 'manual' : 'blocked'
+      throw error
+    }
+  }
+
+  async completeManualVerification(): Promise<void> {
+    if (this.manualState !== 'manual') throw new Error('bridge_manual_not_open')
+    this.manualState = 'checking'
+    try {
+      await this.context!.close()
+      this.context = null
+      this.manualWindowVisible = false
+      this.clearObservations()
+      await this.launchOwnedContext(true)
+      // Only the explicit human-completed operation clears the old latch; fresh checks can relatch it.
+      this.restricted = false
+      await this.refresh(true)
+      const seen = await this.snapshot(undefined, true)
+      if (seen.blocked || !seen.live || !seen.admin || !seen.canSend
+        || seen.ownerId !== this.config.expectedOwnerId || seen.executorId !== this.config.expectedExecutorId) {
+        throw new Error('bridge_manual_recheck_failed')
+      }
+      this.manualState = 'none'
+    } catch (error) { this.manualState = 'blocked'; this.restricted = true; throw error }
+  }
 
   async start(): Promise<void> {
     this.url = (await discoverRoom(this.config.capturePaths, this.config.anchorName)).url
@@ -111,7 +179,8 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
     page.on('close', () => { if (kind === 'self') this.self = null; else this.room = null })
   }
 
-  async refresh(): Promise<void> {
+  async refresh(completingManual = false): Promise<void> {
+    if (this.manualState !== 'none' && !(completingManual && this.manualState === 'checking')) throw new Error('bridge_manual_verification_active')
     if (this.restricted) throw new Error('room_platform_restricted')
     if (this.pending) return this.pending
     const pages = [this.selfPage, this.roomPage]
@@ -158,7 +227,8 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
           className: x.className, dataE2e: x.getAttribute('data-e2e') })),
     })).catch(() => null) : null
     if (this.ownedPid) await ownedBrowserWindows(this.ownedPid, this.config.profileDir, false)
-    return { transport: this.ownedPid ? 'hidden_owned_browser' : 'headless_browser', desktopVisible: false, roomUrl: this.url,
+    return { transport: this.manualState === 'manual' ? 'manual_verification' : this.ownedPid ? 'hidden_owned_browser' : 'headless_browser',
+      desktopVisible: this.manualWindowVisible, manualState: this.manualState, roomUrl: this.url,
       loggedIn: this.self?.id === this.config.expectedExecutorId,
       ownerMatches: room?.ownerId === this.config.expectedOwnerId,
       live: room?.live ?? false, roomId: room?.live ? room.roomId : null,
@@ -170,7 +240,11 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
       refreshFailure: this.refreshFailure, diagnostic: this.roomDiagnostic, controls }
   }
 
-  async snapshot(signal?: AbortSignal): Promise<ReplySnapshot> {
+  async snapshot(signal?: AbortSignal, completingManual = false): Promise<ReplySnapshot> {
+    const assertMode = () => {
+      if (this.manualState !== 'none' && !(completingManual && this.manualState === 'checking')) throw new Error('bridge_manual_verification_active')
+    }
+    assertMode()
     if (this.ownedPid) await ownedBrowserWindows(this.ownedPid, this.config.profileDir, false)
     if (signal?.aborted) throw new Error('room_request_cancelled')
     if (!this.self || !this.room || Date.now() - Math.min(this.self.at, this.room.at) > 20_000) await this.refresh()
@@ -187,6 +261,7 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
       canSend = await input.count() === 1 && await submit.count() === 1
         && await input.isVisible() && await input.isEditable() && await submit.isVisible()
     }
+    assertMode()
     return { ownerId: this.room.value.ownerId, roomId: this.room.value.roomId,
       executorId: this.self.id, live: this.room.value.live,
       admin: this.room.value.adminIds.includes(this.self.id), canSend, blocked: this.restricted,
@@ -195,11 +270,13 @@ export class RoomBrowserDriver implements BackgroundReplyDriver {
   }
 
   async submit(text: string, beforeSubmit: () => Promise<void>, signal?: AbortSignal) {
+    if (this.manualState !== 'none') throw new Error('bridge_manual_verification_active')
     const page = this.roomPage
     if (!page || !this.config.inputSelector || !this.config.submitSelector) throw new Error('room_controls_unconfigured')
     const input = page.locator(this.config.inputSelector)
     await input.fill(text, { timeout: 1000 })
     await beforeSubmit()
+    if (this.manualState !== 'none') throw new Error('bridge_manual_verification_active')
     if (signal?.aborted) throw new Error('room_request_cancelled')
     // One attempt, no Enter fallback and no retry. Click is never reported as delivery confirmation.
     await page.evaluate(({ inputSelector, submitSelector, expectedText, expectedUrl }) => {

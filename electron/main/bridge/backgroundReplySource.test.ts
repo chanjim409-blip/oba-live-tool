@@ -36,6 +36,25 @@ test('background reply requires current actor, room, platform role and fresh obs
   }
 })
 
+test('human verification blocks pending actions and cannot clear an attempted/unknown send', async () => {
+  const env = setup()
+  env.state({ blocked: true })
+  await assert.rejects(() => env.source.withContext('douyin_room', ctx => ctx.read()), /platform_restricted/)
+  env.source.beginManualVerification()
+  env.state({ blocked: false })
+  await assert.rejects(() => env.source.withContext('douyin_room', ctx => ctx.read()), /manual_verification_active/)
+  env.source.completeManualVerification()
+  await env.source.withContext('douyin_room', ctx => ctx.read())
+  env.before(async () => { env.source.beginManualVerification() })
+  await assert.rejects(() => env.source.withContext('douyin_room', ctx => ctx.execute(action)), /manual_verification_active/)
+  assert.equal(env.sends(), 0)
+  env.source.completeManualVerification()
+  env.before(async () => {})
+  assert.equal((await env.source.withContext('douyin_room', ctx => ctx.execute(action))).status, 'uncertain')
+  assert.throws(() => env.source.beginManualVerification(), /requires_reconcile/)
+  assert.throws(() => env.source.completeManualVerification(), /requires_reconcile/)
+})
+
 test('switching page/account or session while preparing text prevents the irreversible submit', async () => {
   for (const change of ['page', 'session', 'cancel', 'deadline']) {
     const env = setup(); const controller = new AbortController()

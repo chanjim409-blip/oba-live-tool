@@ -25,6 +25,19 @@ export interface BackgroundReplyDriver {
 export class BackgroundReplySource implements HostIdentitySource {
   private lastAttemptAt = -Infinity
   private halted = false
+  private manualVerification = false
+
+  beginManualVerification(): void {
+    // Human login cannot be used to clear unknown delivery or to enable a second send.
+    if (Number.isFinite(this.lastAttemptAt)) throw new HostIdentityError('host_reply_attempt_requires_reconcile')
+    this.manualVerification = true
+  }
+
+  completeManualVerification(): void {
+    if (!this.manualVerification || Number.isFinite(this.lastAttemptAt)) throw new HostIdentityError('host_reply_attempt_requires_reconcile')
+    this.halted = false
+    this.manualVerification = false
+  }
   constructor(private readonly driver: BackgroundReplyDriver,
     private readonly scope: () => RegisteredScope | null,
     private readonly expected: { ownerId: string; executorId: string; minIntervalMs: number },
@@ -38,6 +51,7 @@ export class BackgroundReplySource implements HostIdentitySource {
     if (!scope) throw new HostIdentityError('host_session_not_registered')
     let pinned: ReplySnapshot | null = null
     const assertCurrent = (signal?: AbortSignal) => {
+      if (this.manualVerification) throw new HostIdentityError('host_manual_verification_active')
       if (signal?.aborted) throw new HostIdentityError('host_request_cancelled')
       if (this.halted) throw new HostIdentityError('host_reply_halted')
       if (!sameScope(this.scope(), scope)) throw new HostIdentityError('host_context_changed')

@@ -4,6 +4,45 @@ import { createServer } from 'node:http'
 import { chromium } from 'playwright'
 import { RoomBrowserDriver } from './roomBrowserDriver'
 
+test('manual handoff closes the owned context first, blocks sends/refresh, and stays blocked on failed recheck', async () => {
+  const driver = new RoomBrowserDriver({ profileDir: 'synthetic', executablePath: '', capturePaths: [],
+    anchorName: 'synthetic', expectedOwnerId: 'owner', expectedExecutorId: 'assistant' })
+  const sequence: string[] = []
+  const page = { goto: async () => { sequence.push('navigate') }, bringToFront: async () => {}, isClosed: () => false }
+  Object.assign(driver, { context: { close: async () => { sequence.push('close') } },
+    launchOwnedContext: async (headless: boolean) => {
+      sequence.push(headless ? 'headless' : 'visible')
+      Object.assign(driver, { selfPage: page, roomPage: page, context: { close: async () => { sequence.push('close') } } })
+    } })
+  await driver.beginManualVerification()
+  assert.deepEqual(sequence.slice(0, 2), ['close', 'visible'])
+  assert.equal((await driver.inspect()).manualState, 'manual')
+  await assert.rejects(() => driver.snapshot(), /manual_verification_active/)
+  await assert.rejects(() => driver.refresh(), /manual_verification_active/)
+  let submits = 0
+  await assert.rejects(() => driver.submit('synthetic', async () => { submits++ }), /manual_verification_active/)
+  assert.equal(submits, 0)
+  await assert.rejects(() => driver.completeManualVerification()) // no new platform evidence in this fake
+  assert.equal((await driver.inspect()).manualState, 'blocked')
+  assert.equal((await driver.inspect()).restricted, true)
+  await assert.rejects(() => driver.snapshot(), /manual_verification_active/)
+})
+
+test('manual completion returns to background only after fresh identity checks and never submits', async () => {
+  const driver = new RoomBrowserDriver({ profileDir: 'synthetic', executablePath: '', capturePaths: [],
+    anchorName: 'synthetic', expectedOwnerId: 'owner', expectedExecutorId: 'assistant' })
+  let checked = false
+  Object.assign(driver, { manualState: 'manual', manualWindowVisible: true,
+    context: { close: async () => {} }, launchOwnedContext: async () => {}, refresh: async () => {},
+    snapshot: async () => { checked = true; return { blocked: false, live: true, admin: true, canSend: true, ownerId: 'owner', executorId: 'assistant' } } })
+  await driver.completeManualVerification()
+  assert.equal(checked, true)
+  const info = await driver.inspect()
+  assert.equal(info.manualState, 'none')
+  assert.equal(info.desktopVisible, false)
+  await assert.rejects(() => driver.completeManualVerification(), /manual_not_open/)
+})
+
 test('preflight stays readable when renderer evaluation never resolves', async () => {
   const driver = new RoomBrowserDriver({ profileDir: 'synthetic', executablePath: '', capturePaths: [],
     anchorName: 'synthetic', expectedOwnerId: 'owner', expectedExecutorId: 'assistant' })
