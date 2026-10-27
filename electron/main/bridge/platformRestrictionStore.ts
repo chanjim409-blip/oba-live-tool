@@ -30,4 +30,12 @@ export class PlatformRestrictionStore {
       this.db.database.exec('COMMIT')
     } catch (error) { this.db.database.exec('ROLLBACK'); throw error }
   }
+
+  /** Audit only; cannot change or clear the durable stop. */
+  recordInspection(event: 'inspection_requested' | 'inspection_opened'): void {
+    const code = this.read()
+    if (!code) throw new Error('inspection_stop_not_persisted')
+    this.db.prepare('INSERT INTO buyin_restriction_history(at,event,code) VALUES(?,?,?)')
+      .run(new Date(this.now()).toISOString(), event, code)
+  }
 }

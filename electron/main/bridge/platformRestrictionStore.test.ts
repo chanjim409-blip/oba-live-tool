@@ -9,6 +9,81 @@ import { LiveTap } from './liveTap'
 import { startBridgeServer } from './bridgeServer'
 import type { RoomBrowserDriver } from './roomBrowserDriver'
 
+test('manual inspection is authenticated, explicitly requested and preserves stop across restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'buyin-inspection-'))
+  const token = 'synthetic-token-'.repeat(4)
+  const db = openHostBridgeDb(join(dir, 'host-identity.sqlite'))
+  new PlatformRestrictionStore(db.db).record('host_platform_restricted')
+  db.close()
+  let opens = 0, closes = 0, release!: () => void, started!: () => void
+  const startedPromise = new Promise<void>(resolve => { started = resolve })
+  const pending = new Promise<void>(resolve => { release = resolve })
+  let status: 'idle' | 'open' | 'closed' = 'idle'
+  const fake = { get status() { return status }, open: async (check: () => void) => {
+    opens++; check(); started(); await pending; check(); status = 'open'
+  }, close: async () => { closes++; status = 'closed' } }
+  const replyBrowser = { profileDir: 'synthetic', executablePath: 'synthetic', capturePaths: [], anchorName: 'synthetic',
+    expectedOwnerId: 'synthetic', expectedExecutorId: 'synthetic' }
+  try {
+    const host = await startBridgeServer({ port: 0, token, dataDir: dir, storageStatePath: null,
+      replyBrowser, inspectionFactory: () => fake, log: () => {} })
+    const url = `http://127.0.0.1:${host.port}`
+    const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' }
+    const post = (body: unknown, extra = {}) => fetch(`${url}/reply/manual-inspection`, { method: 'POST', headers: { ...headers, ...extra }, body: JSON.stringify(body) })
+    try {
+      assert.equal((await fetch(`${url}/reply/manual-inspection`, { method: 'POST' })).status, 401)
+      assert.equal((await post({ confirmed: true }, { origin: 'https://foreign.invalid' })).status, 403)
+      assert.equal((await post({ confirmed: true, extra: true })).status, 400)
+      const first = post({ confirmed: true })
+      await startedPromise
+      assert.equal((await post({ confirmed: true })).status, 409)
+      assert.equal(opens, 1)
+      release()
+      const response = await first
+      assert.equal(response.status, 200)
+      assert.deepEqual(await response.json(), { opened: true, mode: 'human_inspection', restriction_code: 'host_platform_restricted' })
+      status = 'closed' // The person closes the inspection window; this never clears the stop.
+      const inspectionState = await fetch(`${url}/reply/manual-inspection`, { headers })
+      assert.deepEqual(await inspectionState.json(), { mode: 'human_inspection', state: 'closed', restriction_code: 'host_platform_restricted' })
+      const state = await fetch(`${url}/collector/restriction`, { headers })
+      assert.deepEqual(await state.json(), { restriction_code: 'host_platform_restricted' })
+      assert.equal((await post({ confirmed: true })).status, 409)
+    } finally { release(); await host.stop() }
+    assert.equal(closes, 1)
+    const reopened = openHostBridgeDb(join(dir, 'host-identity.sqlite'))
+    try {
+      assert.equal(new PlatformRestrictionStore(reopened.db).read(), 'host_platform_restricted')
+      const history = reopened.db.prepare('SELECT event FROM buyin_restriction_history ORDER BY rowid').all<{ event: string }>()
+      assert.deepEqual(history.map(row => row.event), ['stopped', 'inspection_requested', 'inspection_opened'])
+    } finally { reopened.close() }
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('manual inspection never starts when stop is absent or a send switch is enabled', async () => {
+  for (const mode of ['no-stop', 'send-enabled']) {
+    const dir = mkdtempSync(join(tmpdir(), 'buyin-inspection-'))
+    const token = 'synthetic-token-'.repeat(4)
+    if (mode === 'send-enabled') {
+      const db = openHostBridgeDb(join(dir, 'host-identity.sqlite'))
+      new PlatformRestrictionStore(db.db).record('host_platform_restricted'); db.close()
+    }
+    let opens = 0
+    const host = await startBridgeServer({ port: 0, token, dataDir: dir, storageStatePath: null,
+      replyExecutionEnabled: mode === 'send-enabled',
+      replyBrowser: { profileDir: 'synthetic', executablePath: 'synthetic', capturePaths: [], anchorName: 'synthetic',
+        expectedOwnerId: 'synthetic', expectedExecutorId: 'synthetic' },
+      // No-stop startup would normally launch the reply driver; supply a failing fake.
+      replyDriverFactory: () => ({ start: async () => { throw new Error('synthetic') }, stop: async () => {} }) as never,
+      inspectionFactory: () => ({ status: 'idle', open: async () => { opens++ }, close: async () => {} }), log: () => {} })
+    try {
+      const response = await fetch(`http://127.0.0.1:${host.port}/reply/manual-inspection`, { method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ confirmed: true }) })
+      assert.equal(response.status, 409)
+      assert.equal(opens, 0)
+    } finally { await host.stop(); rmSync(dir, { recursive: true, force: true }) }
+  }
+})
+
 test('platform stop survives process/database reopen and prevents any browser launch', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'buyin-stop-'))
   const file = join(dir, 'host-identity.sqlite')

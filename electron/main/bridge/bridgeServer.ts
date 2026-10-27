@@ -29,6 +29,7 @@ import { RoomBrowserDriver, type RoomBrowserConfig } from './roomBrowserDriver'
 import { BackgroundReplySource } from './backgroundReplySource'
 import { BuyinReplyDriver, type BuyinReplyConfig } from './buyinReplyDriver'
 import { PlatformRestrictionStore } from './platformRestrictionStore'
+import { ManualInspectionWindow } from './manualInspection'
 
 export interface BridgeServerConfig {
   port: number
@@ -58,6 +59,8 @@ export interface BridgeServerConfig {
   /** Offline fault injection only; real startup uses the SQLite-backed store and room browser. */
   restrictionStoreFactory?: (db: ReturnType<typeof openHostBridgeDb>['db']) => PlatformRestrictionStore
   replyDriverFactory?: (config: RoomBrowserConfig) => RoomBrowserDriver
+  /** Offline tests only. Production uses the strictly scoped inspection window. */
+  inspectionFactory?: (config: RoomBrowserConfig) => Pick<ManualInspectionWindow, 'open' | 'close' | 'status'>
 }
 
 export interface RunningBridgeServer {
@@ -128,6 +131,7 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
   }
   let replyDriver: RoomBrowserDriver | null = null
   let tap: LiveTap | null = null
+  let inspection: Pick<ManualInspectionWindow, 'open' | 'close' | 'status'> | null = null
   let volatileStop: 'host_restriction_store_unavailable' | null = hadStorageFault ? 'host_restriction_store_unavailable' : null
   const stopOwnedBrowsers = () => {
     const owned = replyDriver
@@ -141,6 +145,7 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
     // Also latch the collector itself so no later health tick may refresh it.
     if (tap && !tap.restrictionCode) tap.markPlatformRestriction('host_platform_restricted')
     stopOwnedBrowsers()
+    void inspection?.close().catch(() => undefined)
   }
   const currentRestriction = () => {
     if (volatileStop) return volatileStop
@@ -300,6 +305,43 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
         const recorded = currentRestriction()
         if (recorded === 'host_restriction_store_unavailable') throw new HostIdentityError(recorded)
         json(200, { restriction_code: recorded })
+        return
+      }
+
+      // Explicit human inspection only. Never removes a stop or enables/executes any platform action.
+      if (url.pathname === '/reply/manual-inspection' && request.method === 'POST') {
+        const body = await readJson(request)
+        if (Object.keys(body).length !== 1 || body.confirmed !== true) { json(400, { error_code: 'bridge_manual_confirmation_required' }); return }
+        if (inspection) { json(409, { error_code: 'bridge_inspection_already_started' }); return }
+        if (!config.replyBrowser || config.replyExecutionEnabled === true || config.buyinReplyExecutionEnabled === true || replyDriver || replySource) {
+          json(409, { error_code: 'bridge_inspection_not_available' }); return
+        }
+        const stopped = currentRestriction()
+        if (!stopped || stopped === 'host_restriction_store_unavailable' || restrictionStore.read() !== stopped) {
+          json(409, { error_code: 'bridge_inspection_stop_not_persisted' }); return
+        }
+        const assertInspectionStopped = () => {
+          if (request.aborted || response.destroyed || response.writableEnded) throw new Error('inspection_request_cancelled')
+          if (currentRestriction() !== stopped || restrictionStore.read() !== stopped) throw new Error('inspection_stop_changed')
+        }
+        // Reserve before awaiting anything. A failed attempt remains reserved until this host stops.
+        inspection = (config.inspectionFactory ?? (value => new ManualInspectionWindow(value)))(config.replyBrowser)
+        try {
+          restrictionStore.recordInspection('inspection_requested')
+          await inspection.open(assertInspectionStopped)
+          assertInspectionStopped()
+          restrictionStore.recordInspection('inspection_opened')
+          json(200, { opened: true, mode: 'human_inspection', restriction_code: stopped })
+        } catch (error) {
+          await inspection.close().catch(() => undefined)
+          const allowed = ['inspection_profile_busy_or_unavailable', 'inspection_profile_alias_unsupported', 'inspection_configuration_invalid']
+          const detail = error instanceof Error && allowed.includes(error.message) ? `bridge_${error.message}` : 'bridge_inspection_open_failed'
+          json(409, { error_code: detail, restriction_code: currentRestriction() })
+        }
+        return
+      }
+      if (url.pathname === '/reply/manual-inspection' && request.method === 'GET') {
+        json(200, { mode: 'human_inspection', state: inspection?.status ?? 'idle', restriction_code: currentRestriction() })
         return
       }
 
@@ -529,6 +571,7 @@ export async function startBridgeServer(config: BridgeServerConfig): Promise<Run
       await new Promise<void>((resolve) => server.close(() => resolve()))
       await tap?.stop()
       await replyDriver?.stop()
+      await inspection?.close()
       opened.close()
     },
   }
